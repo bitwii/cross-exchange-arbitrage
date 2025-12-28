@@ -102,11 +102,13 @@ class LighterClient(BaseExchangeClient):
         """Initialize the Lighter client using official SDK."""
         if self.lighter_client is None:
             try:
+                # Create api_private_keys dictionary with the index as key
+                api_private_keys = {self.api_key_index: self.api_key_private_key}
+
                 self.lighter_client = SignerClient(
                     url=self.base_url,
-                    private_key=self.api_key_private_key,
                     account_index=self.account_index,
-                    api_key_index=self.api_key_index,
+                    api_private_keys=api_private_keys,
                 )
 
                 # Check client
