@@ -1,4 +1,14 @@
-##### 关注我 **X (Twitter)**: [@yourQuantGuy](https://x.com/yourQuantGuy)
+这个套利程序从QuantGuy的代码fork而来，做了如下改进：
+1. 之前引用的Lighter SDK已经无法使用，因此修改为适配最新Lighter SDK，同时在requirement.txt也做了更新。因此程序可以直接运行了。
+2. 运行时bbo数据不断保存，会产生海量数据，几天时间就有几个G的数据，因此修改为如果没有成交就一小时记录一次。
+
+
+
+
+
+
+
+##### 关注QuantGuy大大： **X (Twitter)**: [@yourQuantGuy](https://x.com/yourQuantGuy)
 
 ---
 
