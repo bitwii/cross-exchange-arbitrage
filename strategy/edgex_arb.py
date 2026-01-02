@@ -79,6 +79,11 @@ class EdgexArb:
         # Position tracker (will be initialized after clients)
         self.position_tracker = None
 
+        # BBO logging control (log every hour when no trades)
+        self.last_bbo_log_time = None  # None means never logged, will trigger first log
+        self.last_status_log_time = None  # None means never logged, will trigger first log
+        self.bbo_log_interval = 3600  # 1 hour in seconds
+
         # Setup callbacks
         self._setup_callbacks()
 
@@ -105,8 +110,8 @@ class EdgexArb:
         console_handler.setLevel(logging.INFO)
 
         # Create formatters
-        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        console_formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
+        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+        console_formatter = logging.Formatter('%(levelname)s:%(name)s:[%(filename)s:%(lineno)d]:%(message)s')
 
         file_handler.setFormatter(file_formatter)
         console_handler.setFormatter(console_formatter)
@@ -510,6 +515,8 @@ class EdgexArb:
         self.position_tracker.edgex_position = await self.position_tracker.get_edgex_position()
         self.position_tracker.lighter_position = await self.position_tracker.get_lighter_position()
 
+        self.logger.info(f"📍 Starting main trading loop for {self.ticker}")
+
         # Main trading loop
         while not self.stop_flag:
             try:
@@ -538,17 +545,45 @@ class EdgexArb:
                   ex_best_ask - lighter_ask > self.short_ex_threshold):
                 short_ex = True
 
-            # Log BBO data
-            self.data_logger.log_bbo_to_csv(
-                maker_bid=ex_best_bid,
-                maker_ask=ex_best_ask,
-                lighter_bid=lighter_bid if lighter_bid else Decimal('0'),
-                lighter_ask=lighter_ask if lighter_ask else Decimal('0'),
-                long_maker=long_ex,
-                short_maker=short_ex,
-                long_maker_threshold=self.long_ex_threshold,
-                short_maker_threshold=self.short_ex_threshold
+            # Check if we should log BBO data (only when trading or every hour)
+            current_time = time.time()
+            should_log_bbo = (
+                long_ex or short_ex or  # Trading opportunity detected
+                self.last_bbo_log_time is None or  # First time logging
+                (current_time - self.last_bbo_log_time >= self.bbo_log_interval)  # Hourly log
             )
+
+            if should_log_bbo:
+                # Log BBO data
+                self.logger.info(f"📝 Logging BBO data (long_ex={long_ex}, short_ex={short_ex}, first_time={self.last_bbo_log_time is None})")
+                self.data_logger.log_bbo_to_csv(
+                    maker_bid=ex_best_bid,
+                    maker_ask=ex_best_ask,
+                    lighter_bid=lighter_bid if lighter_bid else Decimal('0'),
+                    lighter_ask=lighter_ask if lighter_ask else Decimal('0'),
+                    long_maker=long_ex,
+                    short_maker=short_ex,
+                    long_maker_threshold=self.long_ex_threshold,
+                    short_maker_threshold=self.short_ex_threshold
+                )
+                self.last_bbo_log_time = current_time
+
+            # Log status every hour when no trading opportunities
+            if not long_ex and not short_ex and (
+                self.last_status_log_time is None or
+                (current_time - self.last_status_log_time >= self.bbo_log_interval)
+            ):
+                long_spread = (lighter_bid - ex_best_bid) if (lighter_bid and ex_best_bid) else Decimal('0')
+                short_spread = (ex_best_ask - lighter_ask) if (ex_best_ask and lighter_ask) else Decimal('0')
+                self.logger.info(
+                    f"📊 Hourly Status - EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                    f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
+                    f"Long spread={long_spread:.2f} (threshold={self.long_ex_threshold}), "
+                    f"Short spread={short_spread:.2f} (threshold={self.short_ex_threshold}) | "
+                    f"EdgeX position={self.position_tracker.get_current_edgex_position()}, "
+                    f"Lighter position={self.position_tracker.lighter_position}"
+                )
+                self.last_status_log_time = current_time
 
             if self.stop_flag:
                 break
@@ -556,9 +591,17 @@ class EdgexArb:
             # Execute trades
             if (self.position_tracker.get_current_edgex_position() < self.max_position and
                     long_ex):
+                self.logger.info(f"🔍 Long EdgeX opportunity detected: "
+                                 f"Lighter Bid {lighter_bid} - EdgeX Bid {ex_best_bid} = "
+                                 f"{lighter_bid - ex_best_bid} > {self.long_ex_threshold}")
+                self.last_status_log_time = current_time  # Reset status log time after trade log
                 await self._execute_long_trade()
             elif (self.position_tracker.get_current_edgex_position() > -1 * self.max_position and
                   short_ex):
+                self.logger.info(f"🔍 Short EdgeX opportunity detected: "
+                                 f"EdgeX Ask {ex_best_ask} - Lighter Ask {lighter_ask} = "
+                                 f"{ex_best_ask - lighter_ask} > {self.short_ex_threshold}")
+                self.last_status_log_time = current_time  # Reset status log time after trade log
                 await self._execute_short_trade()
             else:
                 await asyncio.sleep(0.05)

@@ -9,5 +9,5 @@ git+https://github.com/your-quantguy/edgex-python-sdk.git@7ce85b6ebfa9df0a6f6252
 
 
 # Lighter exchange SDK
-# git+https://github.com/elliottech/lighter-python.git
+git+https://github.com/elliottech/lighter-python.git
 # git+https://github.com/elliottech/lighter-python.git@d0009799970aad54ebb940aa3dc90cbc00028c54

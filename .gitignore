@@ -209,3 +209,13 @@ __marimo__/
 # logs
 logs/
 *.csv
+
+# 忽略 macOS 系统产生的索引文件（你 status 中的那份）
+.DS_Store
+
+# 忽略你个人的 Python 虚拟环境目录（你 status 中的那份）
+crarbenv/
+
+# (可选) 忽略包含敏感 API Key 的环境变量文件 (虽然模板里已有 .env，但确保万无一失)
+.env
+.env.local

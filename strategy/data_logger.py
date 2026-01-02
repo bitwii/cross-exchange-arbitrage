@@ -26,7 +26,7 @@ class DataLogger:
         self.bbo_csv_file = None
         self.bbo_csv_writer = None
         self.bbo_write_counter = 0
-        self.bbo_flush_interval = 10  # Flush every N writes
+        self.bbo_flush_interval = 1  # Flush every write (was 10, changed for hourly logging)
 
         self._initialize_csv_file()
         self._initialize_bbo_csv_file()
@@ -73,7 +73,7 @@ class DataLogger:
                 exchange,
                 timestamp,
                 side,
-                price,
+                                       price,
                 quantity
             ])
 

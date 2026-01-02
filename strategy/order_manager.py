@@ -207,7 +207,7 @@ class OrderManager:
 
         try:
             client_order_index = int(time.time() * 1000)
-            tx_info, error = self.lighter_client.sign_create_order(
+            tx_type, tx_info, tx_hash, error = self.lighter_client.sign_create_order(
                 market_index=self.lighter_market_index,
                 client_order_index=client_order_index,
                 base_amount=int(quantity * self.base_amount_multiplier),
@@ -221,8 +221,9 @@ class OrderManager:
             if error is not None:
                 raise Exception(f"Sign error: {error}")
 
-            tx_hash = await self.lighter_client.send_tx(
-                tx_type=self.lighter_client.TX_TYPE_CREATE_ORDER,
+            # Send transaction
+            await self.lighter_client.send_tx(
+                tx_type=tx_type,
                 tx_info=tx_info
             )
 
@@ -234,7 +235,7 @@ class OrderManager:
         except Exception as e:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
             return None
-
+# 如果等不到，就回滚，使用市价成交，order_execution_complete实现了确保EdgeX和Lighter的订单都完成才进入下一轮交易
     async def monitor_lighter_order(self, client_order_index: int, stop_flag):
         """Monitor Lighter order and wait for fill."""
         start_time = time.time()
