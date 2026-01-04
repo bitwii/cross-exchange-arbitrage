@@ -26,17 +26,32 @@ class DataLogger:
         self.bbo_csv_file = None
         self.bbo_csv_writer = None
         self.bbo_write_counter = 0
-        self.bbo_flush_interval = 1  # Flush every write (was 10, changed for hourly logging)
+        self.bbo_flush_interval = 100  # Flush every 100 rows
+        self.bbo_flush_timeout = 60    # Or flush every 60 seconds
+        self.last_bbo_flush_time = None  # Initialize on first write
 
-        self._initialize_csv_file()
+        # Trade CSV file handles for efficient writing (kept open)
+        self.trade_csv_file = None
+        self.trade_csv_writer = None
+        self.trade_write_counter = 0
+        self.trade_flush_interval = 10  # Flush every 10 trades
+        self.last_trade_flush_time = None  # Initialize on first write
+
+        self._initialize_trade_csv_file()
         self._initialize_bbo_csv_file()
 
-    def _initialize_csv_file(self):
-        """Initialize CSV file with headers if it doesn't exist."""
-        if not os.path.exists(self.csv_filename):
-            with open(self.csv_filename, 'w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity'])
+    def _initialize_trade_csv_file(self):
+        """Initialize trade CSV file with headers if it doesn't exist."""
+        file_exists = os.path.exists(self.csv_filename)
+
+        # Open file in append mode with 8KB buffer
+        self.trade_csv_file = open(self.csv_filename, 'a', newline='', buffering=8192)
+        self.trade_csv_writer = csv.writer(self.trade_csv_file)
+
+        # Write header only if file is new
+        if not file_exists:
+            self.trade_csv_writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity'])
+            self.trade_csv_file.flush()  # Ensure header is written immediately
 
     def _initialize_bbo_csv_file(self):
         """Initialize BBO CSV file with headers if it doesn't exist."""
@@ -65,19 +80,40 @@ class DataLogger:
 
     def log_trade_to_csv(self, exchange: str, side: str, price: str, quantity: str):
         """Log trade details to CSV file."""
+        import time
+
+        if not self.trade_csv_file or not self.trade_csv_writer:
+            # Fallback: reinitialize if file handle is lost
+            self._initialize_trade_csv_file()
+
         timestamp = datetime.now(pytz.UTC).isoformat()
 
-        with open(self.csv_filename, 'a', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow([
-                exchange,
-                timestamp,
-                side,
-                                       price,
-                quantity
-            ])
+        try:
+            self.trade_csv_writer.writerow([exchange, timestamp, side, price, quantity])
+            self.trade_write_counter += 1
 
-        self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+            # Initialize timestamp on first write
+            if self.last_trade_flush_time is None:
+                self.last_trade_flush_time = time.time()
+
+            # Flush every N trades or every 30 seconds
+            current_time = time.time()
+            if (self.trade_write_counter >= self.trade_flush_interval or
+                (current_time - self.last_trade_flush_time) >= 30):
+                self.trade_csv_file.flush()
+                self.trade_write_counter = 0
+                self.last_trade_flush_time = current_time
+
+            self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+        except Exception as e:
+            self.logger.error(f"Error writing trade to CSV: {e}")
+            # Try to reinitialize on error
+            try:
+                if self.trade_csv_file:
+                    self.trade_csv_file.close()
+            except Exception:
+                pass
+            self._initialize_trade_csv_file()
 
 
     def _get_log_timestamp(self):
@@ -134,9 +170,24 @@ class DataLogger:
 
             # Increment counter and flush periodically
             self.bbo_write_counter += 1
-            if self.bbo_write_counter >= self.bbo_flush_interval:
+
+            # Initialize timestamp on first write
+            if self.last_bbo_flush_time is None:
+                import time
+                self.last_bbo_flush_time = time.time()
+
+            # Flush based on row count or time interval
+            import time
+            current_time = time.time()
+            should_flush = (
+                self.bbo_write_counter >= self.bbo_flush_interval or
+                (current_time - self.last_bbo_flush_time) >= self.bbo_flush_timeout
+            )
+
+            if should_flush:
                 self.bbo_csv_file.flush()
                 self.bbo_write_counter = 0
+                self.last_bbo_flush_time = current_time
         except Exception as e:
             self.logger.error(f"Error writing to BBO CSV: {e}")
             # Try to reinitialize on error
@@ -149,6 +200,7 @@ class DataLogger:
 
     def close(self):
         """Close file handles."""
+        # Close BBO CSV file
         if self.bbo_csv_file:
             try:
                 self.bbo_csv_file.flush()
@@ -164,3 +216,20 @@ class DataLogger:
                 self.logger.error(f"Error closing BBO CSV file: {e}")
                 self.bbo_csv_file = None
                 self.bbo_csv_writer = None
+
+        # Close trade CSV file
+        if self.trade_csv_file:
+            try:
+                self.trade_csv_file.flush()
+                self.trade_csv_file.close()
+                self.trade_csv_file = None
+                self.trade_csv_writer = None
+                self.logger.info("📊 Trade CSV file closed")
+            except (ValueError, OSError) as e:
+                # File already closed or I/O error - ignore silently
+                self.trade_csv_file = None
+                self.trade_csv_writer = None
+            except Exception as e:
+                self.logger.error(f"Error closing trade CSV file: {e}")
+                self.trade_csv_file = None
+                self.trade_csv_writer = None

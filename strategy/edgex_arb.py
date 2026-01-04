@@ -109,6 +109,14 @@ class EdgexArb:
         file_handler = logging.FileHandler(self.log_filename)
         file_handler.setLevel(logging.INFO)
 
+        # Increase buffer size to 64KB for better performance
+        if hasattr(file_handler, 'stream') and hasattr(file_handler.stream, 'reconfigure'):
+            try:
+                file_handler.stream.reconfigure(buffering=65536)  # 64KB buffer
+            except Exception:
+                # If reconfigure not available (Python < 3.7), ignore
+                pass
+
         # Create console handler
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
@@ -324,6 +332,23 @@ class EdgexArb:
                 self.edgex_ws_manager.disconnect_all()
         except Exception as e:
             self.logger.error(f"Error disconnecting EdgeX WebSocket manager: {e}")
+
+        # Flush all logging handlers before exit
+        try:
+            for handler in self.logger.handlers:
+                if hasattr(handler, 'flush'):
+                    handler.flush()
+            self.logger.info("📝 All log handlers flushed")
+        except Exception as e:
+            # Use print as fallback since logger might be broken
+            print(f"Error flushing log handlers: {e}")
+
+        # Ensure data logger is closed (redundant safety check)
+        try:
+            if self.data_logger:
+                self.data_logger.close()
+        except Exception as e:
+            print(f"Error in final data_logger close: {e}")
 
     def setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown."""
