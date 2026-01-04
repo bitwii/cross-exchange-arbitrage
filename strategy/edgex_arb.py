@@ -84,6 +84,10 @@ class EdgexArb:
         self.last_status_log_time = None  # None means never logged, will trigger first log
         self.bbo_log_interval = 3600  # 1 hour in seconds
 
+        # Price tolerance for trade execution (to avoid stale price trading)
+        # If price moves more than this percentage, cancel the trade
+        self.price_tolerance_pct = Decimal('0.05')  # 0.05% price change tolerance
+
         # Setup callbacks
         self._setup_callbacks()
 
@@ -620,7 +624,8 @@ class EdgexArb:
                     f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
                     f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
                 self.last_status_log_time = current_time  # Reset status log time after trade log
-                await self._execute_long_trade()
+                # Pass expected prices for validation
+                await self._execute_long_trade(expected_edgex_ask=ex_best_ask, expected_lighter_bid=lighter_bid)
             elif (self.position_tracker.get_current_edgex_position() > -1 * self.max_position and
                   short_ex):
                 spread = ex_best_ask - lighter_ask
@@ -634,27 +639,43 @@ class EdgexArb:
                     f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
                     f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
                 self.last_status_log_time = current_time  # Reset status log time after trade log
-                await self._execute_short_trade()
+                # Pass expected prices for validation
+                await self._execute_short_trade(expected_edgex_bid=ex_best_bid, expected_lighter_ask=lighter_ask)
             else:
                 await asyncio.sleep(0.05)
 
-    async def _execute_long_trade(self):
+    async def _execute_long_trade(self, expected_edgex_ask=None, expected_lighter_bid=None):
         """Execute a long trade (buy on EdgeX, sell on Lighter)."""
+        trade_start_time = time.time()
+        self.logger.info(f"⏱️ LONG TRADE START")
+
         if self.stop_flag:
             return
 
-        # Update positions
+        # Update positions in parallel to reduce latency
         try:
-            self.position_tracker.edgex_position = await asyncio.wait_for(
-                self.position_tracker.get_edgex_position(),
-                timeout=3.0
+            position_start = time.time()
+            # Execute both position queries in parallel
+            edgex_task = asyncio.create_task(
+                asyncio.wait_for(self.position_tracker.get_edgex_position(), timeout=3.0)
             )
+            lighter_task = asyncio.create_task(
+                asyncio.wait_for(self.position_tracker.get_lighter_position(), timeout=3.0)
+            )
+
+            self.position_tracker.edgex_position = await edgex_task
+            edgex_position_time = time.time() - position_start
+            self.logger.info(f"⏱️ EdgeX position query: {edgex_position_time:.3f}s")
+
             if self.stop_flag:
                 return
-            self.position_tracker.lighter_position = await asyncio.wait_for(
-                self.position_tracker.get_lighter_position(),
-                timeout=3.0
-            )
+
+            lighter_position_start = time.time()
+            self.position_tracker.lighter_position = await lighter_task
+            lighter_position_time = time.time() - lighter_position_start
+            total_position_time = time.time() - position_start
+            self.logger.info(f"⏱️ Lighter position query: {lighter_position_time:.3f}s")
+            self.logger.info(f"⏱️ Total position queries (parallel): {total_position_time:.3f}s")
         except asyncio.TimeoutError:
             if self.stop_flag:
                 return
@@ -677,14 +698,33 @@ class EdgexArb:
             self.logger.error(
                 f"❌ Position diff is too large: {self.position_tracker.get_net_position()}")
             sys.exit(1)
+
+        # Check price tolerance before placing order (for long trade)
+        if expected_edgex_ask is not None:
+            current_edgex_ask = self.order_book_manager.get_edgex_bbo()[1]
+            if current_edgex_ask:
+                price_change_pct = abs((current_edgex_ask - expected_edgex_ask) / expected_edgex_ask * 100)
+                self.logger.info(
+                    f"🔍 [Price Check] Expected EdgeX ask: {expected_edgex_ask}, "
+                    f"Current: {current_edgex_ask}, Change: {price_change_pct:.3f}%")
+
+                if price_change_pct > self.price_tolerance_pct:
+                    self.logger.warning(
+                        f"⚠️ Price moved too much! Change {price_change_pct:.3f}% > tolerance {self.price_tolerance_pct}%. "
+                        f"Cancelling trade to avoid unfavorable execution.")
+                    return
 
         self.order_manager.order_execution_complete = False
         self.order_manager.waiting_for_lighter_fill = False
 
         try:
             side = 'buy'
+            order_start = time.time()
             order_filled = await self.order_manager.place_edgex_post_only_order(
                 side, self.order_quantity, self.stop_flag)
+            order_time = time.time() - order_start
+            self.logger.info(f"⏱️ EdgeX order placement: {order_time:.3f}s")
+
             if not order_filled or self.stop_flag:
                 return
         except Exception as e:
@@ -697,12 +737,15 @@ class EdgexArb:
         start_time = time.time()
         while not self.order_manager.order_execution_complete and not self.stop_flag:
             if self.order_manager.waiting_for_lighter_fill:
+                hedge_start = time.time()
                 await self.order_manager.place_lighter_market_order(
                     self.order_manager.current_lighter_side,
                     self.order_manager.current_lighter_quantity,
                     self.order_manager.current_lighter_price,
                     self.stop_flag
                 )
+                hedge_time = time.time() - hedge_start
+                self.logger.info(f"⏱️ Lighter hedge placement: {hedge_time:.3f}s")
                 break
 
             await asyncio.sleep(0.01)
@@ -710,23 +753,41 @@ class EdgexArb:
                 self.logger.error("❌ Timeout waiting for trade completion")
                 break
 
-    async def _execute_short_trade(self):
+        total_time = time.time() - trade_start_time
+        self.logger.info(f"⏱️ LONG TRADE TOTAL EXECUTION: {total_time:.3f}s")
+
+    async def _execute_short_trade(self, expected_edgex_bid=None, expected_lighter_ask=None):
         """Execute a short trade (sell on EdgeX, buy on Lighter)."""
+        trade_start_time = time.time()
+        self.logger.info(f"⏱️ SHORT TRADE START")
+
         if self.stop_flag:
             return
 
-        # Update positions
+        # Update positions in parallel to reduce latency
         try:
-            self.position_tracker.edgex_position = await asyncio.wait_for(
-                self.position_tracker.get_edgex_position(),
-                timeout=3.0
+            position_start = time.time()
+            # Execute both position queries in parallel
+            edgex_task = asyncio.create_task(
+                asyncio.wait_for(self.position_tracker.get_edgex_position(), timeout=3.0)
             )
+            lighter_task = asyncio.create_task(
+                asyncio.wait_for(self.position_tracker.get_lighter_position(), timeout=3.0)
+            )
+
+            self.position_tracker.edgex_position = await edgex_task
+            edgex_position_time = time.time() - position_start
+            self.logger.info(f"⏱️ EdgeX position query: {edgex_position_time:.3f}s")
+
             if self.stop_flag:
                 return
-            self.position_tracker.lighter_position = await asyncio.wait_for(
-                self.position_tracker.get_lighter_position(),
-                timeout=3.0
-            )
+
+            lighter_position_start = time.time()
+            self.position_tracker.lighter_position = await lighter_task
+            lighter_position_time = time.time() - lighter_position_start
+            total_position_time = time.time() - position_start
+            self.logger.info(f"⏱️ Lighter position query: {lighter_position_time:.3f}s")
+            self.logger.info(f"⏱️ Total position queries (parallel): {total_position_time:.3f}s")
         except asyncio.TimeoutError:
             if self.stop_flag:
                 return
@@ -750,13 +811,32 @@ class EdgexArb:
                 f"❌ Position diff is too large: {self.position_tracker.get_net_position()}")
             sys.exit(1)
 
+        # Check price tolerance before placing order (for short trade)
+        if expected_edgex_bid is not None:
+            current_edgex_bid = self.order_book_manager.get_edgex_bbo()[0]
+            if current_edgex_bid:
+                price_change_pct = abs((current_edgex_bid - expected_edgex_bid) / expected_edgex_bid * 100)
+                self.logger.info(
+                    f"🔍 [Price Check] Expected EdgeX bid: {expected_edgex_bid}, "
+                    f"Current: {current_edgex_bid}, Change: {price_change_pct:.3f}%")
+
+                if price_change_pct > self.price_tolerance_pct:
+                    self.logger.warning(
+                        f"⚠️ Price moved too much! Change {price_change_pct:.3f}% > tolerance {self.price_tolerance_pct}%. "
+                        f"Cancelling trade to avoid unfavorable execution.")
+                    return
+
         self.order_manager.order_execution_complete = False
         self.order_manager.waiting_for_lighter_fill = False
 
         try:
             side = 'sell'
+            order_start = time.time()
             order_filled = await self.order_manager.place_edgex_post_only_order(
                 side, self.order_quantity, self.stop_flag)
+            order_time = time.time() - order_start
+            self.logger.info(f"⏱️ EdgeX order placement: {order_time:.3f}s")
+
             if not order_filled or self.stop_flag:
                 return
         except Exception as e:
@@ -769,18 +849,24 @@ class EdgexArb:
         start_time = time.time()
         while not self.order_manager.order_execution_complete and not self.stop_flag:
             if self.order_manager.waiting_for_lighter_fill:
+                hedge_start = time.time()
                 await self.order_manager.place_lighter_market_order(
                     self.order_manager.current_lighter_side,
                     self.order_manager.current_lighter_quantity,
                     self.order_manager.current_lighter_price,
                     self.stop_flag
                 )
+                hedge_time = time.time() - hedge_start
+                self.logger.info(f"⏱️ Lighter hedge placement: {hedge_time:.3f}s")
                 break
 
             await asyncio.sleep(0.01)
             if time.time() - start_time > 180:
                 self.logger.error("❌ Timeout waiting for trade completion")
                 break
+
+        total_time = time.time() - trade_start_time
+        self.logger.info(f"⏱️ SHORT TRADE TOTAL EXECUTION: {total_time:.3f}s")
 
     async def run(self):
         """Run the arbitrage bot."""
