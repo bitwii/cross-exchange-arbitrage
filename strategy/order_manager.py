@@ -102,18 +102,33 @@ class OrderManager:
         """Place a BBO order on EdgeX."""
         best_bid, best_ask = await self.fetch_edgex_bbo_prices()
 
+        self.logger.info(f"💰 [Price Check] EdgeX BBO before placing order: bid={best_bid}, ask={best_ask}")
+
         if side.lower() == 'buy':
             order_price = best_ask - self.edgex_tick_size
             order_side = OrderSide.BUY
+            self.logger.info(
+                f"📊 [Buy Order] Calculated price: ask({best_ask}) - tick_size({self.edgex_tick_size}) = {order_price}")
         else:
             order_price = best_bid + self.edgex_tick_size
             order_side = OrderSide.SELL
+            self.logger.info(
+                f"📊 [Sell Order] Calculated price: bid({best_bid}) + tick_size({self.edgex_tick_size}) = {order_price}")
+
+        rounded_price = self.round_to_tick(order_price)
+        self.logger.info(f"🔢 [Price Rounding] {order_price} → {rounded_price} (after rounding to tick)")
 
         self.edgex_client_order_id = str(int(time.time() * 1000))
+
+        self.logger.info(
+            f"📤 [Sending Order] EdgeX {side.upper()} order: "
+            f"quantity={quantity}, price={rounded_price}, post_only=True, "
+            f"client_order_id={self.edgex_client_order_id}")
+
         order_result = await self.edgex_client.create_limit_order(
             contract_id=self.edgex_contract_id,
             size=str(quantity),
-            price=str(self.round_to_tick(order_price)),
+            price=str(rounded_price),
             side=order_side,
             post_only=True,
             client_order_id=self.edgex_client_order_id
@@ -125,6 +140,8 @@ class OrderManager:
         order_id = order_result['data'].get('orderId')
         if not order_id:
             raise Exception("No order ID in response")
+
+        self.logger.info(f"✅ [Order Placed] EdgeX order_id={order_id}, waiting for fill...")
 
         return order_id
 
@@ -191,14 +208,25 @@ class OrderManager:
         if not best_bid or not best_ask:
             raise Exception("Lighter order book not ready")
 
+        self.logger.info(
+            f"💰 [Price Check] Lighter BBO before placing order: "
+            f"bid={best_bid[0]} (size={best_bid[1]}), ask={best_ask[0]} (size={best_ask[1]})")
+
+        original_price = price
         if lighter_side.lower() == 'buy':
             order_type = "CLOSE"
             is_ask = False
             price = best_ask[0] * Decimal('1.002')
+            self.logger.info(
+                f"📊 [Buy Order] Price adjustment: best_ask({best_ask[0]}) × 1.002 = {price} "
+                f"(EdgeX reference price: {original_price})")
         else:
             order_type = "OPEN"
             is_ask = True
             price = best_bid[0] * Decimal('0.998')
+            self.logger.info(
+                f"📊 [Sell Order] Price adjustment: best_bid({best_bid[0]}) × 0.998 = {price} "
+                f"(EdgeX reference price: {original_price})")
 
         self.lighter_order_filled = False
         self.lighter_order_price = price
@@ -207,11 +235,21 @@ class OrderManager:
 
         try:
             client_order_index = int(time.time() * 1000)
+
+            base_amount_raw = int(quantity * self.base_amount_multiplier)
+            price_raw = int(price * self.price_multiplier)
+
+            self.logger.info(
+                f"📤 [Sending Order] Lighter {lighter_side.upper()} order: "
+                f"quantity={quantity} (raw={base_amount_raw}), "
+                f"price={price} (raw={price_raw}), "
+                f"is_ask={is_ask}, client_order_id={client_order_index}")
+
             tx_type, tx_info, tx_hash, error = self.lighter_client.sign_create_order(
                 market_index=self.lighter_market_index,
                 client_order_index=client_order_index,
-                base_amount=int(quantity * self.base_amount_multiplier),
-                price=int(price * self.price_multiplier),
+                base_amount=base_amount_raw,
+                price=price_raw,
                 is_ask=is_ask,
                 order_type=self.lighter_client.ORDER_TYPE_LIMIT,
                 time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
@@ -227,7 +265,9 @@ class OrderManager:
                 tx_info=tx_info
             )
 
-            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {quantity}")
+            self.logger.info(
+                f"✅ [Order Sent] Lighter [{order_type}] {lighter_side.upper()}: "
+                f"{quantity} @ {price}, tx_hash={tx_hash[:10]}..., waiting for fill...")
 
             await self.monitor_lighter_order(client_order_index, stop_flag)
 
@@ -236,17 +276,72 @@ class OrderManager:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
             return None
 # 如果等不到，就回滚，使用市价成交，order_execution_complete实现了确保EdgeX和Lighter的订单都完成才进入下一轮交易
+
+    async def query_lighter_order_status(self, client_order_index: int) -> Optional[dict]:
+        """Query Lighter order status from API."""
+        try:
+            if not self.lighter_client:
+                return None
+
+            # Get all orders for this account
+            orders = self.lighter_client.get_orders(
+                market_index=self.lighter_market_index
+            )
+
+            if not orders:
+                return None
+
+            # Find order by client_order_id
+            for order in orders:
+                if order.get('client_order_id') == client_order_index:
+                    self.logger.info(
+                        f"📋 Found order: status={order.get('status')}, "
+                        f"filled={order.get('filled_base_amount', 0)}, "
+                        f"size={order.get('base_amount', 0)}")
+                    return order
+
+            self.logger.warning(f"⚠️ Order with client_order_id={client_order_index} not found in API")
+            return None
+
+        except Exception as e:
+            self.logger.error(f"❌ Error querying Lighter order: {e}")
+            return None
+
     async def monitor_lighter_order(self, client_order_index: int, stop_flag):
         """Monitor Lighter order and wait for fill."""
         start_time = time.time()
         while not self.lighter_order_filled and not stop_flag:
             if time.time() - start_time > 30:
+                elapsed = time.time() - start_time
                 self.logger.error(
-                    f"❌ Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
-                self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
-                self.lighter_order_filled = True
-                self.waiting_for_lighter_fill = False
-                self.order_execution_complete = True
+                    f"❌ Timeout waiting for Lighter order fill after {elapsed:.1f}s")
+
+                # Try to query order status before giving up
+                self.logger.info(f"🔍 Querying Lighter order status for client_order_id={client_order_index}")
+
+                try:
+                    # Query order status from Lighter API
+                    order_status = await self.query_lighter_order_status(client_order_index)
+
+                    if order_status and order_status.get('status') == 'FILLED':
+                        self.logger.info(f"✅ Found filled order via API query!")
+                        # Process the order fill
+                        self.handle_lighter_order_filled(order_status)
+                    else:
+                        self.logger.warning(
+                            f"⚠️ Order not filled or not found. Status: {order_status.get('status') if order_status else 'UNKNOWN'}")
+                        self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
+                        self.lighter_order_filled = True
+                        self.waiting_for_lighter_fill = False
+                        self.order_execution_complete = True
+
+                except Exception as e:
+                    self.logger.error(f"❌ Error querying order status: {e}")
+                    self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
+                    self.lighter_order_filled = True
+                    self.waiting_for_lighter_fill = False
+                    self.order_execution_complete = True
+
                 break
 
             await asyncio.sleep(0.1)
@@ -254,31 +349,44 @@ class OrderManager:
     def handle_lighter_order_filled(self, order_data: dict):
         """Handle Lighter order fill notification."""
         try:
-            order_data["avg_filled_price"] = (
-                Decimal(order_data["filled_quote_amount"]) /
-                Decimal(order_data["filled_base_amount"])
-            )
-            if order_data["is_ask"]:
+            # Calculate average filled price
+            if "avg_filled_price" not in order_data:
+                filled_quote = Decimal(str(order_data.get("filled_quote_amount", 0)))
+                filled_base = Decimal(str(order_data.get("filled_base_amount", 0)))
+                if filled_base > 0:
+                    order_data["avg_filled_price"] = filled_quote / filled_base
+                else:
+                    self.logger.error("❌ Filled base amount is 0, cannot calculate avg price")
+                    return
+
+            # Determine side
+            if order_data.get("is_ask") or order_data.get("side") == "SELL":
                 order_data["side"] = "SHORT"
                 order_type = "OPEN"
             else:
                 order_data["side"] = "LONG"
                 order_type = "CLOSE"
 
-            client_order_index = order_data["client_order_id"]
+            client_order_index = order_data.get("client_order_id", "UNKNOWN")
+            filled_amount = order_data.get("filled_base_amount", 0)
+            avg_price = order_data.get("avg_filled_price", 0)
 
             self.logger.info(
                 f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
-                f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+                f"{filled_amount} @ {avg_price}")
 
+            # Call the callback
             if self.on_order_filled:
                 self.on_order_filled(order_data)
 
+            # Mark as filled
             self.lighter_order_filled = True
             self.order_execution_complete = True
 
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
 
     def get_edgex_client_order_id(self) -> str:
         """Get current EdgeX client order ID."""

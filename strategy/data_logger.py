@@ -79,6 +79,26 @@ class DataLogger:
 
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
 
+
+    def _get_log_timestamp(self):
+        """
+        生成精简格式的时间戳: YYMMDDT HH:MM:SS.msTZ
+        示例: 260103T11:58:56.12+00
+        """
+        now = datetime.now(pytz.UTC)
+
+        # %y: 两位年份, %m%d: 月日, T: 分隔符, %H:%M:%S: 时分秒
+        main_part = now.strftime("%y%m%dT%H:%M:%S")
+
+        # %f 是 6 位微秒，取前两位变成 10 毫秒精度
+        ms = now.strftime("%f")[:2]
+
+        # %z 是 +0000 格式，取前三位变成 +00
+        tz = now.strftime("%z")[:3]
+
+        return f"{main_part}.{ms}{tz}"
+
+
     def log_bbo_to_csv(self, maker_bid: Decimal, maker_ask: Decimal, lighter_bid: Decimal,
                        lighter_ask: Decimal, long_maker: bool, short_maker: bool,
                        long_maker_threshold: Decimal, short_maker_threshold: Decimal):
@@ -87,7 +107,7 @@ class DataLogger:
             # Fallback: reinitialize if file handle is lost
             self._initialize_bbo_csv_file()
 
-        timestamp = datetime.now(pytz.UTC).isoformat()
+        timestamp = self._get_log_timestamp()
 
         # Calculate spreads
         long_maker_spread = (lighter_bid - maker_bid

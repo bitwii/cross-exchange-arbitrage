@@ -92,7 +92,7 @@ class EdgexArb:
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/edgex_{self.ticker}_log.txt"
 
-        self.logger = logging.getLogger(f"arbitrage_bot_{self.ticker}")
+        self.logger = logging.getLogger(f"arbi_{self.ticker}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
 
@@ -134,34 +134,44 @@ class EdgexArb:
     def _handle_lighter_order_filled(self, order_data: dict):
         """Handle Lighter order fill."""
         try:
-            order_data["avg_filled_price"] = (
-                Decimal(order_data["filled_quote_amount"]) /
-                Decimal(order_data["filled_base_amount"])
-            )
-            if order_data["is_ask"]:
+            # Calculate average filled price if not already present
+            if "avg_filled_price" not in order_data:
+                filled_quote = Decimal(order_data.get("filled_quote_amount", 0))
+                filled_base = Decimal(order_data.get("filled_base_amount", 0))
+                if filled_base > 0:
+                    order_data["avg_filled_price"] = filled_quote / filled_base
+                else:
+                    self.logger.error("❌ Cannot calculate avg price: filled_base_amount is 0")
+                    return
+
+            # Determine side and order type
+            if order_data.get("is_ask") or order_data.get("side") == "SELL":
                 order_data["side"] = "SHORT"
                 order_type = "OPEN"
                 if self.position_tracker:
-                    self.position_tracker.update_lighter_position(
-                        -Decimal(order_data["filled_base_amount"]))
+                    filled_amount = Decimal(str(order_data.get("filled_base_amount", 0)))
+                    self.position_tracker.update_lighter_position(-filled_amount)
             else:
                 order_data["side"] = "LONG"
                 order_type = "CLOSE"
                 if self.position_tracker:
-                    self.position_tracker.update_lighter_position(
-                        Decimal(order_data["filled_base_amount"]))
+                    filled_amount = Decimal(str(order_data.get("filled_base_amount", 0)))
+                    self.position_tracker.update_lighter_position(filled_amount)
 
-            client_order_index = order_data["client_order_id"]
+            client_order_index = order_data.get("client_order_id", "UNKNOWN")
+            filled_base_amount = order_data.get("filled_base_amount", 0)
+            avg_filled_price = order_data.get("avg_filled_price", 0)
+
             self.logger.info(
                 f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
-                f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+                f"{filled_base_amount} @ {avg_filled_price}")
 
             # Log trade to CSV
             self.data_logger.log_trade_to_csv(
                 exchange='lighter',
                 side=order_data['side'],
-                price=str(order_data['avg_filled_price']),
-                quantity=str(order_data['filled_base_amount'])
+                price=str(avg_filled_price),
+                quantity=str(filled_base_amount)
             )
 
             # Mark execution as complete
@@ -170,6 +180,8 @@ class EdgexArb:
 
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
 
     def _handle_edgex_order_update(self, order: dict):
         """Handle EdgeX order update from WebSocket."""
@@ -200,6 +212,9 @@ class EdgexArb:
 
             # Handle filled orders
             if status == 'FILLED' and filled_size > 0:
+                self.logger.info(
+                    f"✅ [EdgeX Filled] {side.upper()} {filled_size} @ {price} (order_id={order_id})")
+
                 if side == 'buy':
                     if self.position_tracker:
                         self.position_tracker.update_edgex_position(filled_size)
@@ -220,6 +235,9 @@ class EdgexArb:
                     )
 
                 # Trigger Lighter order placement
+                self.logger.info(
+                    f"🔄 [Trigger Hedge] EdgeX {side} filled, preparing Lighter hedge order...")
+
                 self.order_manager.handle_edgex_order_update({
                     'order_id': order_id,
                     'side': side,
@@ -576,12 +594,12 @@ class EdgexArb:
                 long_spread = (lighter_bid - ex_best_bid) if (lighter_bid and ex_best_bid) else Decimal('0')
                 short_spread = (ex_best_ask - lighter_ask) if (ex_best_ask and lighter_ask) else Decimal('0')
                 self.logger.info(
-                    f"📊 Hourly Status - EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
-                    f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
-                    f"Long spread={long_spread:.2f} (threshold={self.long_ex_threshold}), "
-                    f"Short spread={short_spread:.2f} (threshold={self.short_ex_threshold}) | "
-                    f"EdgeX position={self.position_tracker.get_current_edgex_position()}, "
-                    f"Lighter position={self.position_tracker.lighter_position}"
+                    f"📊 Hourly EX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                    f"LT: bid={lighter_bid}, ask={lighter_ask} | "
+                    f"L spread={long_spread:.2f} (threshold={self.long_ex_threshold}), "
+                    f"S spread={short_spread:.2f} (threshold={self.short_ex_threshold}) | "
+                    f"EX position={self.position_tracker.get_current_edgex_position()}, "
+                    f"LT position={self.position_tracker.lighter_position}"
                 )
                 self.last_status_log_time = current_time
 
@@ -591,16 +609,30 @@ class EdgexArb:
             # Execute trades
             if (self.position_tracker.get_current_edgex_position() < self.max_position and
                     long_ex):
-                self.logger.info(f"🔍 Long EdgeX opportunity detected: "
-                                 f"Lighter Bid {lighter_bid} - EdgeX Bid {ex_best_bid} = "
-                                 f"{lighter_bid - ex_best_bid} > {self.long_ex_threshold}")
+                spread = lighter_bid - ex_best_bid
+                self.logger.info(
+                    f"🔍 [OPPORTUNITY] Long EdgeX detected! "
+                    f"Lighter_bid={lighter_bid} - EdgeX_bid={ex_best_bid} = {spread:.2f} > threshold={self.long_ex_threshold}")
+                self.logger.info(
+                    f"💡 [Strategy] Will BUY on EdgeX @ ~{ex_best_ask} (ask-tick), "
+                    f"then SELL on Lighter @ ~{lighter_bid}")
+                self.logger.info(
+                    f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                    f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
                 self.last_status_log_time = current_time  # Reset status log time after trade log
                 await self._execute_long_trade()
             elif (self.position_tracker.get_current_edgex_position() > -1 * self.max_position and
                   short_ex):
-                self.logger.info(f"🔍 Short EdgeX opportunity detected: "
-                                 f"EdgeX Ask {ex_best_ask} - Lighter Ask {lighter_ask} = "
-                                 f"{ex_best_ask - lighter_ask} > {self.short_ex_threshold}")
+                spread = ex_best_ask - lighter_ask
+                self.logger.info(
+                    f"🔍 [OPPORTUNITY] Short EdgeX detected! "
+                    f"EdgeX_ask={ex_best_ask} - Lighter_ask={lighter_ask} = {spread:.2f} > threshold={self.short_ex_threshold}")
+                self.logger.info(
+                    f"💡 [Strategy] Will SELL on EdgeX @ ~{ex_best_bid} (bid+tick), "
+                    f"then BUY on Lighter @ ~{lighter_ask}")
+                self.logger.info(
+                    f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                    f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
                 self.last_status_log_time = current_time  # Reset status log time after trade log
                 await self._execute_short_trade()
             else:
