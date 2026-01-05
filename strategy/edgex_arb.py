@@ -636,36 +636,59 @@ class EdgexArb:
                 break
 
             # Execute trades
-            if (self.position_tracker.get_current_edgex_position() < self.max_position and
-                    long_ex):
+            current_position = self.position_tracker.get_current_edgex_position()
+
+            # Check long opportunity
+            if long_ex:
                 spread = lighter_bid - ex_best_bid
-                self.logger.info(
-                    f"🔍 [OPPORTUNITY] Long EdgeX detected! "
-                    f"Lighter_bid={lighter_bid} - EdgeX_bid={ex_best_bid} = {spread:.2f} > threshold={self.long_ex_threshold}")
-                self.logger.info(
-                    f"💡 [Strategy] Will BUY on EdgeX @ ~{ex_best_ask} (ask-tick), "
-                    f"then SELL on Lighter @ ~{lighter_bid}")
-                self.logger.info(
-                    f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
-                    f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
-                self.last_status_log_time = current_time  # Reset status log time after trade log
-                # Pass expected prices for validation
-                await self._execute_long_trade(expected_edgex_ask=ex_best_ask, expected_lighter_bid=lighter_bid)
-            elif (self.position_tracker.get_current_edgex_position() > -1 * self.max_position and
-                  short_ex):
+                if current_position < self.max_position:
+                    # Can execute long trade
+                    self.logger.info(
+                        f"🔍 [OPPORTUNITY] Long EdgeX detected! "
+                        f"Lighter_bid={lighter_bid} - EdgeX_bid={ex_best_bid} = {spread:.2f} > threshold={self.long_ex_threshold}")
+                    self.logger.info(
+                        f"💡 [Strategy] Will BUY on EdgeX @ ~{ex_best_ask} (ask-tick), "
+                        f"then SELL on Lighter @ ~{lighter_bid}")
+                    self.logger.info(
+                        f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                        f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
+                    self.last_status_log_time = current_time  # Reset status log time after trade log
+                    # Pass expected prices for validation
+                    await self._execute_long_trade(expected_edgex_ask=ex_best_ask, expected_lighter_bid=lighter_bid)
+                else:
+                    # Already at max long position, only log
+                    self.logger.info(
+                        f"📊 [OPPORTUNITY SKIPPED] Long EdgeX opportunity detected but position limit reached! "
+                        f"Spread={spread:.2f} > threshold={self.long_ex_threshold}, "
+                        f"Current position={current_position} >= max={self.max_position}")
+                    self.last_status_log_time = current_time
+                    await asyncio.sleep(0.05)
+
+            # Check short opportunity
+            elif short_ex:
                 spread = ex_best_ask - lighter_ask
-                self.logger.info(
-                    f"🔍 [OPPORTUNITY] Short EdgeX detected! "
-                    f"EdgeX_ask={ex_best_ask} - Lighter_ask={lighter_ask} = {spread:.2f} > threshold={self.short_ex_threshold}")
-                self.logger.info(
-                    f"💡 [Strategy] Will SELL on EdgeX @ ~{ex_best_bid} (bid+tick), "
-                    f"then BUY on Lighter @ ~{lighter_ask}")
-                self.logger.info(
-                    f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
-                    f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
-                self.last_status_log_time = current_time  # Reset status log time after trade log
-                # Pass expected prices for validation
-                await self._execute_short_trade(expected_edgex_bid=ex_best_bid, expected_lighter_ask=lighter_ask)
+                if current_position > -1 * self.max_position:
+                    # Can execute short trade
+                    self.logger.info(
+                        f"🔍 [OPPORTUNITY] Short EdgeX detected! "
+                        f"EdgeX_ask={ex_best_ask} - Lighter_ask={lighter_ask} = {spread:.2f} > threshold={self.short_ex_threshold}")
+                    self.logger.info(
+                        f"💡 [Strategy] Will SELL on EdgeX @ ~{ex_best_bid} (bid+tick), "
+                        f"then BUY on Lighter @ ~{lighter_ask}")
+                    self.logger.info(
+                        f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                        f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
+                    self.last_status_log_time = current_time  # Reset status log time after trade log
+                    # Pass expected prices for validation
+                    await self._execute_short_trade(expected_edgex_bid=ex_best_bid, expected_lighter_ask=lighter_ask)
+                else:
+                    # Already at max short position, only log
+                    self.logger.info(
+                        f"📊 [OPPORTUNITY SKIPPED] Short EdgeX opportunity detected but position limit reached! "
+                        f"Spread={spread:.2f} > threshold={self.short_ex_threshold}, "
+                        f"Current position={current_position} <= min={-1 * self.max_position}")
+                    self.last_status_log_time = current_time
+                    await asyncio.sleep(0.05)
             else:
                 await asyncio.sleep(0.05)
 
@@ -677,47 +700,11 @@ class EdgexArb:
         if self.stop_flag:
             return
 
-        # Update positions in parallel to reduce latency
-        try:
-            position_start = time.time()
-            # Execute both position queries in parallel
-            edgex_task = asyncio.create_task(
-                asyncio.wait_for(self.position_tracker.get_edgex_position(), timeout=3.0)
-            )
-            lighter_task = asyncio.create_task(
-                asyncio.wait_for(self.position_tracker.get_lighter_position(), timeout=3.0)
-            )
-
-            self.position_tracker.edgex_position = await edgex_task
-            edgex_position_time = time.time() - position_start
-            self.logger.info(f"⏱️ EdgeX position query: {edgex_position_time:.3f}s")
-
-            if self.stop_flag:
-                return
-
-            lighter_position_start = time.time()
-            self.position_tracker.lighter_position = await lighter_task
-            lighter_position_time = time.time() - lighter_position_start
-            total_position_time = time.time() - position_start
-            self.logger.info(f"⏱️ Lighter position query: {lighter_position_time:.3f}s")
-            self.logger.info(f"⏱️ Total position queries (parallel): {total_position_time:.3f}s")
-        except asyncio.TimeoutError:
-            if self.stop_flag:
-                return
-            self.logger.warning("⚠️ Timeout getting positions")
-            return
-        except Exception as e:
-            if self.stop_flag:
-                return
-            self.logger.error(f"⚠️ Error getting positions: {e}")
-            return
-
-        if self.stop_flag:
-            return
-
+        # Use cached positions (updated by order callbacks)
+        # Only query positions at startup or on errors
         self.logger.info(
-            f"EdgeX position: {self.position_tracker.edgex_position} | "
-            f"Lighter position: {self.position_tracker.lighter_position}")
+            f"EdgeX position (cached): {self.position_tracker.edgex_position} | "
+            f"Lighter position (cached): {self.position_tracker.lighter_position}")
 
         if abs(self.position_tracker.get_net_position()) > self.order_quantity * 2:
             self.logger.error(
@@ -789,47 +776,11 @@ class EdgexArb:
         if self.stop_flag:
             return
 
-        # Update positions in parallel to reduce latency
-        try:
-            position_start = time.time()
-            # Execute both position queries in parallel
-            edgex_task = asyncio.create_task(
-                asyncio.wait_for(self.position_tracker.get_edgex_position(), timeout=3.0)
-            )
-            lighter_task = asyncio.create_task(
-                asyncio.wait_for(self.position_tracker.get_lighter_position(), timeout=3.0)
-            )
-
-            self.position_tracker.edgex_position = await edgex_task
-            edgex_position_time = time.time() - position_start
-            self.logger.info(f"⏱️ EdgeX position query: {edgex_position_time:.3f}s")
-
-            if self.stop_flag:
-                return
-
-            lighter_position_start = time.time()
-            self.position_tracker.lighter_position = await lighter_task
-            lighter_position_time = time.time() - lighter_position_start
-            total_position_time = time.time() - position_start
-            self.logger.info(f"⏱️ Lighter position query: {lighter_position_time:.3f}s")
-            self.logger.info(f"⏱️ Total position queries (parallel): {total_position_time:.3f}s")
-        except asyncio.TimeoutError:
-            if self.stop_flag:
-                return
-            self.logger.warning("⚠️ Timeout getting positions")
-            return
-        except Exception as e:
-            if self.stop_flag:
-                return
-            self.logger.error(f"⚠️ Error getting positions: {e}")
-            return
-
-        if self.stop_flag:
-            return
-
+        # Use cached positions (updated by order callbacks)
+        # Only query positions at startup or on errors
         self.logger.info(
-            f"EdgeX position: {self.position_tracker.edgex_position} | "
-            f"Lighter position: {self.position_tracker.lighter_position}")
+            f"EdgeX position (cached): {self.position_tracker.edgex_position} | "
+            f"Lighter position (cached): {self.position_tracker.lighter_position}")
 
         if abs(self.position_tracker.get_net_position()) > self.order_quantity * 2:
             self.logger.error(

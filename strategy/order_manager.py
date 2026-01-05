@@ -157,15 +157,24 @@ class OrderManager:
         start_time = time.time()
         while not stop_flag:
             if self.edgex_order_status == 'CANCELED':
+                self.logger.warning(
+                    f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled. "
+                    f"Reason: Order was not filled within timeout period or was canceled by exchange.")
                 return False
             elif self.edgex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
                 await asyncio.sleep(0.5)
                 if time.time() - start_time > 5:
+                    elapsed = time.time() - start_time
+                    self.logger.warning(
+                        f"⚠️ [EdgeX Order Timeout] Order {order_id} not filled after {elapsed:.1f}s. "
+                        f"Current status: {self.edgex_order_status}. Attempting to cancel...")
                     try:
                         cancel_params = CancelOrderParams(order_id=order_id)
                         cancel_result = await self.edgex_client.cancel_order(cancel_params)
                         if not cancel_result or 'data' not in cancel_result:
-                            self.logger.error("❌ Error canceling EdgeX order")
+                            self.logger.error("❌ Error canceling EdgeX order - no valid response")
+                        else:
+                            self.logger.info(f"✅ [EdgeX Order Cancel Request Sent] Order {order_id} cancel request successful")
                     except Exception as e:
                         self.logger.error(f"❌ Error canceling EdgeX order: {e}")
             elif self.edgex_order_status == 'FILLED':
