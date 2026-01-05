@@ -168,25 +168,45 @@ class WebSocketManagerWrapper:
                     # Subscribe to account orders updates
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
 
-                    # Get auth token for the subscription
-                    try:
-                        ten_minutes_deadline = int(time.time() + 10 * 60)
-                        auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
-                        if err is not None:
-                            self.logger.warning(f"⚠️ Failed to create auth token: {err}")
-                        else:
-                            auth_message = {
-                                "type": "subscribe",
-                                "channel": account_orders_channel,
-                                "auth": auth_token
-                            }
-                            await ws.send(json.dumps(auth_message))
-                            self.logger.info("✅ Subscribed to account orders with auth token (expires in 10 minutes)")
-                    except Exception as e:
-                        self.logger.warning(f"⚠️ Error creating auth token: {e}")
+                    # Track auth token expiry time for renewal
+                    auth_token_expiry_time = None
+
+                    # Function to subscribe to account orders with fresh auth token
+                    async def subscribe_account_orders():
+                        nonlocal auth_token_expiry_time
+                        try:
+                            ten_minutes_deadline = int(time.time() + 10 * 60)
+                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
+                            if err is not None:
+                                self.logger.warning(f"⚠️ Failed to create auth token: {err}")
+                                return False
+                            else:
+                                auth_message = {
+                                    "type": "subscribe",
+                                    "channel": account_orders_channel,
+                                    "auth": auth_token
+                                }
+                                await ws.send(json.dumps(auth_message))
+                                auth_token_expiry_time = time.time() + 9 * 60  # Renew at 9 minutes (before 10min expiry)
+                                self.logger.info("✅ Subscribed to account orders with auth token (expires in 10 minutes)")
+                                return True
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ Error creating auth token: {e}")
+                            return False
+
+                    # Initial subscription
+                    await subscribe_account_orders()
 
                     while not self.stop_flag:
                         try:
+                            # Check if auth token needs renewal
+                            if auth_token_expiry_time and time.time() >= auth_token_expiry_time:
+                                self.logger.info("🔄 Auth token expiring soon, renewing subscription...")
+                                if await subscribe_account_orders():
+                                    self.logger.info("✅ Auth token renewed successfully")
+                                else:
+                                    self.logger.warning("⚠️ Failed to renew auth token")
+
                             msg = await asyncio.wait_for(ws.recv(), timeout=1)
 
                             try:
