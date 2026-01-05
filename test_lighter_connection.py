@@ -12,6 +12,27 @@ import lighter
 # Load environment variables
 load_dotenv()
 
+def print_lighter_client_methods():
+    """Print all available methods in Lighter SignerClient."""      
+    python3 << 'EOF'    
+    from lighter.signer_client import SignerClient
+    import inspect
+
+    # 获取所有公开方法
+    methods = [m for m in dir(SignerClient) if not m.startswith('_')]
+
+    print("=== All available methods in SignerClient ===")
+    for method in sorted(methods):
+        print(f"  - {method}")
+
+    print("\n=== Methods containing 'get' ===")
+    get_methods = [m for m in methods if 'get' in m.lower()]
+    for method in sorted(get_methods):
+        print(f"  - {method}")
+    EOF
+
+
+
 async def test_lighter_connection():
     """Test Lighter account connection and fetch basic info."""
 
@@ -165,3 +186,6 @@ async def test_lighter_connection():
 if __name__ == "__main__":
     result = asyncio.run(test_lighter_connection())
     exit(0 if result else 1)
+
+
+

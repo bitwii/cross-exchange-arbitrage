@@ -287,33 +287,25 @@ class OrderManager:
 # 如果等不到，就回滚，使用市价成交，order_execution_complete实现了确保EdgeX和Lighter的订单都完成才进入下一轮交易
 
     async def query_lighter_order_status(self, client_order_index: int) -> Optional[dict]:
-        """Query Lighter order status from API."""
+        """Query Lighter order status from API.
+
+        NOTE: lighter-sdk 1.0.2 does NOT have get_orders() method.
+        Order status can only be tracked via WebSocket updates.
+        This method is a placeholder for future SDK versions.
+        """
         try:
             if not self.lighter_client:
                 return None
 
-            # Get all orders for this account
-            orders = self.lighter_client.get_orders(
-                market_index=self.lighter_market_index
-            )
-
-            if not orders:
-                return None
-
-            # Find order by client_order_id
-            for order in orders:
-                if order.get('client_order_id') == client_order_index:
-                    self.logger.info(
-                        f"📋 Found order: status={order.get('status')}, "
-                        f"filled={order.get('filled_base_amount', 0)}, "
-                        f"size={order.get('base_amount', 0)}")
-                    return order
-
-            self.logger.warning(f"⚠️ Order with client_order_id={client_order_index} not found in API")
+            # lighter-sdk 1.0.2 limitation: No query API available
+            # Only WebSocket updates can provide order status
+            self.logger.warning(
+                f"⚠️ Lighter order query not available (lighter-sdk 1.0.2 limitation). "
+                f"Relying on WebSocket updates only for client_order_id={client_order_index}")
             return None
 
         except Exception as e:
-            self.logger.error(f"❌ Error querying Lighter order: {e}")
+            self.logger.error(f"❌ Error in Lighter order query: {e}")
             return None
 
     async def monitor_lighter_order(self, client_order_index: int, stop_flag):
