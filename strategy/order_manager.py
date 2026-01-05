@@ -157,17 +157,35 @@ class OrderManager:
         start_time = time.time()
         while not stop_flag:
             if self.edgex_order_status == 'CANCELED':
-                self.logger.warning(
-                    f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled. "
-                    f"Reason: Order was not filled within timeout period or was canceled by exchange.")
+                # Log current market price when order is cancelled
+                try:
+                    current_bid, current_ask = await self.fetch_edgex_bbo_prices()
+                    self.logger.warning(
+                        f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled. "
+                        f"Reason: Order was not filled within timeout period or was canceled by exchange. "
+                        f"Market BBO at cancellation: bid={current_bid}, ask={current_ask}")
+                except Exception as e:
+                    self.logger.warning(
+                        f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled. "
+                        f"Reason: Order was not filled within timeout period or was canceled by exchange. "
+                        f"(Failed to fetch current market price: {e})")
                 return False
             elif self.edgex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
                 await asyncio.sleep(0.5)
                 if time.time() - start_time > 5:
                     elapsed = time.time() - start_time
-                    self.logger.warning(
-                        f"⚠️ [EdgeX Order Timeout] Order {order_id} not filled after {elapsed:.1f}s. "
-                        f"Current status: {self.edgex_order_status}. Attempting to cancel...")
+                    # Fetch current market price at timeout
+                    try:
+                        current_bid, current_ask = await self.fetch_edgex_bbo_prices()
+                        self.logger.warning(
+                            f"⚠️ [EdgeX Order Timeout] Order {order_id} not filled after {elapsed:.1f}s. "
+                            f"Current status: {self.edgex_order_status}. "
+                            f"Market BBO at timeout: bid={current_bid}, ask={current_ask}. Attempting to cancel...")
+                    except Exception as e:
+                        self.logger.warning(
+                            f"⚠️ [EdgeX Order Timeout] Order {order_id} not filled after {elapsed:.1f}s. "
+                            f"Current status: {self.edgex_order_status}. "
+                            f"(Failed to fetch current market price: {e}). Attempting to cancel...")
                     try:
                         cancel_params = CancelOrderParams(order_id=order_id)
                         cancel_result = await self.edgex_client.cancel_order(cancel_params)

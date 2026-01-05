@@ -254,9 +254,19 @@ class WebSocketManagerWrapper:
 
                                 elif data.get("type") == "update/account_orders":
                                     orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
+                                    self.logger.info(
+                                        f"📨 [Lighter Order Update] Received {len(orders)} order(s) for market {self.lighter_market_index}")
                                     for order in orders:
-                                        if order.get("status") == "filled" and self.on_lighter_order_filled:
+                                        order_status = order.get("status")
+                                        client_order_id = order.get("client_order_id", "UNKNOWN")
+                                        self.logger.info(
+                                            f"📋 [Lighter Order] client_order_id={client_order_id}, status={order_status}")
+                                        if order_status == "filled" and self.on_lighter_order_filled:
                                             self.on_lighter_order_filled(order)
+                                        elif order_status and order_status != "filled":
+                                            self.logger.warning(
+                                                f"⚠️ [Lighter Order] Received order with status '{order_status}' "
+                                                f"(not 'filled'), order data: {order}")
 
                                 elif (data.get("type") == "update/order_book" and
                                       not self.order_book_manager.lighter_snapshot_loaded):
