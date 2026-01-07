@@ -168,15 +168,22 @@ class WebSocketManagerWrapper:
                     # Subscribe to account orders updates
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
 
-                    # Track auth token expiry time for renewal
-                    auth_token_expiry_time = None
+                    # Track subscription state to prevent duplicate subscriptions
+                    is_subscribed = False
 
-                    # Function to subscribe to account orders with fresh auth token
+                    # Function to subscribe to account orders with auth token
                     async def subscribe_account_orders():
-                        nonlocal auth_token_expiry_time
+                        nonlocal is_subscribed
+
+                        # Skip if already subscribed
+                        if is_subscribed:
+                            self.logger.debug("⏭️ Already subscribed, skipping duplicate subscription")
+                            return True
+
                         try:
-                            ten_minutes_deadline = int(time.time() + 10 * 60)
-                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
+                            # Use default expiry time (SDK handles it automatically)
+                            self.logger.info(f"🔑 Creating auth token for channel: {account_orders_channel}")
+                            auth_token, err = self.lighter_client.create_auth_token_with_expiry()
                             if err is not None:
                                 self.logger.warning(f"⚠️ Failed to create auth token: {err}")
                                 return False
@@ -186,31 +193,31 @@ class WebSocketManagerWrapper:
                                     "channel": account_orders_channel,
                                     "auth": auth_token
                                 }
+                                self.logger.info(f"🔑 Auth token created successfully")
                                 await ws.send(json.dumps(auth_message))
-                                auth_token_expiry_time = time.time() + 9 * 60  # Renew at 9 minutes (before 10min expiry)
-                                self.logger.info("✅ Subscribed to account orders with auth token (expires in 10 minutes)")
+                                is_subscribed = True  # Mark as subscribed
+                                self.logger.info("✅ Subscribed to account orders with auth token")
                                 return True
                         except Exception as e:
                             self.logger.warning(f"⚠️ Error creating auth token: {e}")
                             return False
 
-                    # Initial subscription
+                    # Initial subscription (one-time, remains active until WebSocket disconnects)
                     await subscribe_account_orders()
 
                     while not self.stop_flag:
                         try:
-                            # Check if auth token needs renewal
-                            if auth_token_expiry_time and time.time() >= auth_token_expiry_time:
-                                self.logger.info("🔄 Auth token expiring soon, renewing subscription...")
-                                if await subscribe_account_orders():
-                                    self.logger.info("✅ Auth token renewed successfully")
-                                else:
-                                    self.logger.warning("⚠️ Failed to renew auth token")
-
                             msg = await asyncio.wait_for(ws.recv(), timeout=1)
 
                             try:
                                 data = json.loads(msg)
+                                # Log all message types for debugging (except frequent order_book updates)
+                                msg_type = data.get("type", "UNKNOWN")
+                                if msg_type not in ["update/order_book", "ping"]:
+                                    self.logger.info(f"📬 [Lighter WS] Received message type: {msg_type}")
+                                    # If message type is UNKNOWN, log the full message to debug
+                                    if msg_type == "UNKNOWN":
+                                        self.logger.warning(f"⚠️ [Lighter WS] UNKNOWN message content: {data}")
                             except json.JSONDecodeError as e:
                                 self.logger.warning(f"⚠️ JSON parsing error: {e}")
                                 continue
@@ -243,6 +250,11 @@ class WebSocketManagerWrapper:
                                         f"✅ Lighter order book snapshot loaded with "
                                         f"{len(self.order_book_manager.lighter_order_book['bids'])} bids and "
                                         f"{len(self.order_book_manager.lighter_order_book['asks'])} asks")
+
+                                elif data.get("type") == "subscribed/account_orders":
+                                    # Account orders subscription confirmed
+                                    channel = data.get("channel", "UNKNOWN")
+                                    self.logger.info(f"✅ [Lighter WS] Account orders subscription confirmed for channel: {channel}")
 
                                 elif (data.get("type") == "update/order_book" and
                                       self.order_book_manager.lighter_snapshot_loaded):

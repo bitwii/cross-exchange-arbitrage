@@ -34,7 +34,7 @@ class DataLogger:
         self.trade_csv_file = None
         self.trade_csv_writer = None
         self.trade_write_counter = 0
-        self.trade_flush_interval = 10  # Flush every 10 trades
+        self.trade_flush_interval = 1  # Flush immediately after each trade (changed from 10)
         self.last_trade_flush_time = None  # Initialize on first write
 
         self._initialize_trade_csv_file()
@@ -103,6 +103,7 @@ class DataLogger:
                 self.trade_csv_file.flush()
                 self.trade_write_counter = 0
                 self.last_trade_flush_time = current_time
+                self.logger.info(f"💾 Trade CSV flushed to disk")
 
             self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
         except Exception as e:

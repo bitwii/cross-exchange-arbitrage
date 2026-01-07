@@ -9,6 +9,8 @@ import requests
 import traceback
 from decimal import Decimal
 from typing import Tuple
+from datetime import datetime
+import pytz
 
 from lighter.signer_client import SignerClient
 from edgex_sdk import Client, WebSocketManager
@@ -124,6 +126,18 @@ class EdgexArb:
         # Create formatters
         file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
         console_formatter = logging.Formatter('%(levelname)s:%(name)s:[%(filename)s:%(lineno)d]:%(message)s')
+
+        # Set timezone to UTC+8 (Beijing time)
+        def beijing_time(*args):
+            """Convert to Beijing time (UTC+8)."""
+            import time as time_module
+            utc_time = time_module.gmtime(args[0] if args else None)
+            # Add 8 hours (28800 seconds) for Beijing timezone
+            beijing_timestamp = (args[0] if args else time_module.time()) + 28800
+            return time_module.gmtime(beijing_timestamp)
+
+        file_formatter.converter = beijing_time
+        console_formatter.converter = beijing_time
 
         file_handler.setFormatter(file_formatter)
         console_handler.setFormatter(console_formatter)
