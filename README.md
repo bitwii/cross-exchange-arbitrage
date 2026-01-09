@@ -1,6 +1,6 @@
 这个套利程序从QuantGuy的代码fork而来，做了如下改进：
 1. 之前引用的Lighter SDK已经无法使用，因此修改为适配最新Lighter SDK，同时在requirement.txt也做了更新。因此程序可以直接运行了。
-2. 运行时bbo数据不断保存，会产生海量数据，几天时间就有几个G的数据，因此修改为如果没有成交就一小时记录一次。
+2. 增加了StandX的支持
 
 
 
@@ -38,6 +38,9 @@
 
 10%的即时手续费减免；5% 积分加成
 
+#### StandX： YourGuantGuy的邀请没有出来前可以用这个，感谢：
+[https://standx.com/referral?code=JAAWW] https://standx.com/referral?code=JAAWW
+
 ---
 
 # 跨交易所套利机器人
@@ -46,7 +49,11 @@
 
 ## 项目简介
 
-本项目实现了一个跨交易所套利交易机器人，目前主要在 **edgeX** 和 **Lighter** 两个交易所之间进行价差套利。机器人通过在 edgeX 上挂 post-only 限价单（做市单），在 Lighter 上执行市价单来完成套利交易。
+本项目实现了一个跨交易所套利交易机器人，目前支持以下交易所组合：
+- **EdgeX + Lighter**：在 EdgeX 上挂 post-only 限价单（做市单），在 Lighter 上执行市价单
+- **StandX + Lighter**：在 StandX 上挂 post-only 限价单（做市单），在 Lighter 上执行市价单
+
+机器人通过检测交易所之间的价差来完成套利交易。
 
 ## 功能特性
 
@@ -60,7 +67,9 @@
 ## 系统要求
 
 - Python 3.8+
-- edgeX 和 Lighter 交易所账户
+- 交易所账户（根据需要）：
+  - **EdgeX + Lighter** 组合：需要 EdgeX 和 Lighter 交易所账户
+  - **StandX + Lighter** 组合：需要 StandX (Solana) 和 Lighter 交易所账户
 - API 密钥和访问权限
 
 ## 安装步骤
@@ -108,8 +117,10 @@ cp env_example.txt .env
 
 编辑 `.env` 文件，填入你的 API 信息：
 
+#### EdgeX + Lighter 配置
+
 ```env
-# edgeX 账户凭证（必需）
+# EdgeX 账户凭证（必需）
 EDGEX_ACCOUNT_ID=your_account_id_here
 EDGEX_STARK_PRIVATE_KEY=your_stark_private_key_here
 
@@ -123,46 +134,81 @@ LIGHTER_ACCOUNT_INDEX=your_account_index
 LIGHTER_API_KEY_INDEX=your_api_key_index
 ```
 
+#### StandX + Lighter 配置
+
+```env
+# StandX 配置（Solana 链）
+STANDX_PRIVATE_KEY=你的solana钱包私钥（base58格式）
+STANDX_BASE_URL=https://perps.standx.com
+STANDX_AUTH_URL=https://api.standx.com
+
+# Lighter 配置（必需）
+API_KEY_PRIVATE_KEY=your_api_key_private_key_here
+LIGHTER_ACCOUNT_INDEX=your_account_index
+LIGHTER_API_KEY_INDEX=your_api_key_index
+```
+
 ## 使用方法
 
 ### 基本用法
+
+#### EdgeX 套利（使用 arbitrage.py）
 
 ```bash
 python arbitrage.py --ticker BTC --size 0.002 --max-position 0.1 --long-threshold 10 --short-threshold 10
 ```
 
+#### 多交易所套利（使用 arbitrage2.py）
+
+**EdgeX + Lighter:**
+```bash
+python arbitrage2.py --exchange edgex --ticker BTC --size 0.002 --max-position 0.1 --long-threshold 10 --short-threshold 10
+```
+
+**StandX + Lighter:**
+```bash
+python arbitrage2.py --exchange standx --ticker ETH --size 0.02 --max-position 0.1 --long-threshold 2 --short-threshold 2
+```
+
 ### 命令行参数
 
-- `--exchange`：交易所名称（默认：edgex）
+- `--exchange`：交易所名称（可选：edgex, standx，默认：edgex，仅 arbitrage2.py 支持）
 - `--ticker`：交易对符号（默认：BTC）
 - `--size`：每笔订单的交易数量（必需）
 - `--max-position`：最大持仓限制（必需）
-- `--long-threshold`：做多套利触发阈值（Lighter 买一价高于 edgeX 卖一价超过多少即做多 edgeX 套利，默认：10）
-- `--short-threshold`：做空套利触发阈值（edgeX 买一价高于 Lighter 卖一价超过多少即做空 edgeX 套利，默认：10）
+- `--long-threshold`：做多套利触发阈值（Lighter 买一价高于 Maker 交易所卖一价超过多少即做多套利，默认：10）
+- `--short-threshold`：做空套利触发阈值（Maker 交易所买一价高于 Lighter 卖一价超过多少即做空套利，默认：10）
 - `--fill-timeout`：限价单成交超时时间（秒，默认：5）
 
 ### 使用示例
 
 ```bash
-# 交易 ETH，每笔订单 0.01 ETH，设置 5 秒超时
-python arbitrage.py --ticker ETH --size 0.01 --long-threshold 10 --short-threshold 10 --max-position 0.1 --fill-timeout 5
+# EdgeX - 交易 ETH，每笔订单 0.01 ETH，设置 5 秒超时
+python arbitrage2.py --exchange edgex --ticker ETH --size 0.01 --long-threshold 10 --short-threshold 10 --max-position 0.1 --fill-timeout 5
 
-# 交易 BTC，限制最大持仓为 0.1 BTC
-python arbitrage.py --ticker BTC --size 0.002 --long-threshold 1 --short-threshold 20 --max-position 0.1
+# EdgeX - 交易 BTC，限制最大持仓为 0.1 BTC
+python arbitrage2.py --exchange edgex --ticker BTC --size 0.002 --long-threshold 1 --short-threshold 20 --max-position 0.1
+
+# StandX - 交易 ETH，每笔订单 0.02 ETH
+python arbitrage2.py --exchange standx --ticker ETH --size 0.02 --long-threshold 2 --short-threshold 2 --max-position 0.1
 ```
 
 ## 项目结构
 
 ```
 cross-exchange-arbitrage/
-├── arbitrage.py              # 主程序入口
+├── arbitrage.py              # EdgeX 套利主程序入口
+├── arbitrage2.py             # 支持多交易所的套利入口（EdgeX/StandX）
 ├── exchanges/                # 交易所接口实现
 │   ├── base.py              # 基础交易所接口
-│   ├── edgex.py             # edgeX 交易所实现
+│   ├── edgex.py             # EdgeX 交易所实现
+│   ├── standx.py            # StandX 交易所实现（Solana）
+│   ├── standx_protocol/     # StandX 协议模块（认证、HTTP客户端）
 │   ├── lighter.py           # Lighter 交易所实现
 │   └── lighter_custom_websocket.py  # Lighter WebSocket 管理
 ├── strategy/                 # 交易策略模块
-│   ├── edgex_arb.py         # 主要套利策略
+│   ├── edgex_arb.py         # EdgeX 套利策略
+│   ├── standx_arb.py        # StandX 套利策略
 │   ├── order_book_manager.py    # 订单簿管理
 │   ├── order_manager.py     # 订单管理
 │   ├── position_tracker.py  # 仓位跟踪
@@ -179,10 +225,26 @@ cross-exchange-arbitrage/
 2. **价差检测**：计算两个交易所之间的价差
 3. **套利机会识别**：当价差超过阈值时，识别套利机会
 4. **订单执行**：
-   - 在 edgeX 上挂 post-only 限价单（做市单，赚取手续费）
+   - 在 Maker 交易所（EdgeX 或 StandX）上挂 post-only 限价单（做市单，赚取手续费）
    - 在 Lighter 上执行市价单完成对冲
 5. **仓位管理**：实时跟踪仓位，确保不超过最大持仓限制
 6. **风险控制**：监控订单成交状态，超时未成交则取消订单
+
+## 交易所特性
+
+### EdgeX
+- **认证方式**：Stark 私钥
+- **链**：StarkNet
+- **优势**：成熟稳定，API 完善
+
+### StandX
+- **认证方式**：Solana 钱包签名（复杂 JSON 签名结构）
+- **链**：Solana
+- **优势**：Solana 生态，低延迟
+- **API 特点**：
+  - REST API 用于获取价格、持仓、下单
+  - WebSocket 用于接收订单更新推送
+  - 支持限价单和市价单
 
 ## 注意事项
 
@@ -201,8 +263,11 @@ cross-exchange-arbitrage/
 - `asyncio`：异步编程支持
 - `requests`：HTTP 请求
 - `tenacity`：重试机制
-- `edgex-python-sdk`：edgeX 官方 Python SDK（fork 版本，支持 post-only 限价单）
+- `websockets`：WebSocket 客户端
+- `edgex-python-sdk`：EdgeX 官方 Python SDK（fork 版本，支持 post-only 限价单）
 - `lighter-python`：Lighter 交易所 SDK
+- `base58`：Base58 编码（用于 Solana 私钥）
+- `solders`：Solana Python 库（用于 StandX 签名）
 
 ## 许可证
 

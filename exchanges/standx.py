@@ -126,10 +126,12 @@ class StandXWebSocketManager:
             data = json.loads(message)
 
             # 1. 处理鉴权响应
-            # {"channel": "auth", "data": {"code": 200, "msg": "success"}}
+            # {"channel": "auth", "data": {"code": 0, "message": "success"}}
+            # 注意：code=0 表示成功（不是 200）
             if data.get("channel") == "auth":
                 auth_data = data.get("data", {})
-                if auth_data.get("code") == 200:
+                # StandX 的成功 code 是 0，不是 200
+                if auth_data.get("code") == 0 or auth_data.get("message") == "success":
                     self.logger.info("✅ [WS] Authentication Successful")
                 else:
                     self.logger.error(f"❌ [WS] Auth Failed: {auth_data}")

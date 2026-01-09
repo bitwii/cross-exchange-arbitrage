@@ -12,3 +12,12 @@ EDGEX_WS_URL=wss://quote.edgex.exchange
 API_KEY_PRIVATE_KEY=your_api_key_private_key_here
 LIGHTER_ACCOUNT_INDEX=your_account_index
 LIGHTER_API_KEY_INDEX=your_api_key_index
+
+# 交易对与数量
+TICKER="BTC"
+ORDER_QTY="0.001"
+
+# StandX 配置 (Solana)
+STANDX_PRIVATE_KEY="你的solana钱包私钥（base58格式）"
+STANDX_BASE_URL="https://perps.standx.com"
+STANDX_AUTH_URL="https://api.standx.com"
