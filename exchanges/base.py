@@ -89,8 +89,8 @@ class BaseExchangeClient(ABC):
         pass
 
     @abstractmethod
-    async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
-        """Place an open order."""
+    async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str, price: Optional[Decimal] = None) -> OrderResult:
+        """Place an open order. Price is optional for limit orders."""
         pass
 
     @abstractmethod

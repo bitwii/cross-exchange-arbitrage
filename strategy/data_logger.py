@@ -86,7 +86,9 @@ class DataLogger:
             # Fallback: reinitialize if file handle is lost
             self._initialize_trade_csv_file()
 
-        timestamp = datetime.now(pytz.UTC).isoformat()
+        # Use Beijing time (UTC+8) for consistency with logs
+        beijing_tz = pytz.timezone('Asia/Shanghai')
+        timestamp = datetime.now(beijing_tz).isoformat()
 
         try:
             self.trade_csv_writer.writerow([exchange, timestamp, side, price, quantity])
@@ -103,7 +105,7 @@ class DataLogger:
                 self.trade_csv_file.flush()
                 self.trade_write_counter = 0
                 self.last_trade_flush_time = current_time
-                self.logger.info(f"💾 Trade CSV flushed to disk")
+                #biwii self.logger.info(f"💾 Trade CSV flushed to disk")
 
             self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
         except Exception as e:
@@ -120,9 +122,11 @@ class DataLogger:
     def _get_log_timestamp(self):
         """
         生成精简格式的时间戳: YYMMDDT HH:MM:SS.msTZ
-        示例: 260103T11:58:56.12+00
+        示例: 260103T11:58:56.12+08
+        使用北京时间(UTC+8)
         """
-        now = datetime.now(pytz.UTC)
+        beijing_tz = pytz.timezone('Asia/Shanghai')
+        now = datetime.now(beijing_tz)
 
         # %y: 两位年份, %m%d: 月日, T: 分隔符, %H:%M:%S: 时分秒
         main_part = now.strftime("%y%m%dT%H:%M:%S")
@@ -130,7 +134,7 @@ class DataLogger:
         # %f 是 6 位微秒，取前两位变成 10 毫秒精度
         ms = now.strftime("%f")[:2]
 
-        # %z 是 +0000 格式，取前三位变成 +00
+        # %z 是 +0800 格式，取前三位变成 +08
         tz = now.strftime("%z")[:3]
 
         return f"{main_part}.{ms}{tz}"
