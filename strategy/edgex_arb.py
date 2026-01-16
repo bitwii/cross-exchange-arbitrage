@@ -20,6 +20,7 @@ from .order_book_manager import OrderBookManager
 from .websocket_manager import WebSocketManagerWrapper
 from .order_manager import OrderManager
 from .position_tracker import PositionTracker
+from .dynamic_threshold import DynamicThresholdCalculator
 
 
 class Config:
@@ -56,6 +57,22 @@ class EdgexArb:
         self.ws_manager = WebSocketManagerWrapper(self.order_book_manager, self.logger)
         self.order_manager = OrderManager(self.order_book_manager, self.logger)
 
+        # Initialize dynamic threshold calculator
+        dynamic_window = int(os.getenv('DYNAMIC_THRESHOLD_WINDOW', '1000'))
+        dynamic_interval = int(os.getenv('DYNAMIC_THRESHOLD_UPDATE_INTERVAL', '300'))
+        dynamic_min = Decimal(os.getenv('DYNAMIC_THRESHOLD_MIN', '1.0'))
+        dynamic_max = Decimal(os.getenv('DYNAMIC_THRESHOLD_MAX', '10.0'))
+        dynamic_percentile = float(os.getenv('DYNAMIC_THRESHOLD_PERCENTILE', '0.70'))
+        # 初始化了动态窗口，更新间隔，最小和最大阈值，以及百分位数      
+        self.dynamic_threshold = DynamicThresholdCalculator(
+            window_size=dynamic_window,
+            update_interval=dynamic_interval,
+            min_threshold=dynamic_min,
+            max_threshold=dynamic_max,
+            percentile=dynamic_percentile,
+            logger=self.logger
+        )
+
         # Initialize clients (will be set later)
         self.edgex_client = None
         self.edgex_ws_manager = None
@@ -91,6 +108,33 @@ class EdgexArb:
         # Price tolerance for trade execution (to avoid stale price trading)
         # If price moves more than this percentage, cancel the trade
         self.price_tolerance_pct = Decimal('0.05')  # 0.05% price change tolerance
+
+        # Dynamic threshold configuration
+        self.use_dynamic_threshold = os.getenv('USE_DYNAMIC_THRESHOLD', 'false').lower() == 'true'
+
+        # Close threshold configuration (for closing positions with minimal profit)
+        # When closing, we use a much lower threshold to allow quick exits
+        self.close_threshold_multiplier = Decimal(os.getenv('CLOSE_THRESHOLD_MULTIPLIER', '0.1'))  # 10% of open threshold
+        self.min_close_spread = Decimal(os.getenv('MIN_CLOSE_SPREAD', '0.0'))  # Minimum spread to close (0 = break-even)
+
+        # Time-based close threshold configuration (progressive relaxation)
+        self.enable_time_based_close = os.getenv('ENABLE_TIME_BASED_CLOSE', 'true').lower() == 'true'
+        self.time_based_close_stage1_hours = float(os.getenv('TIME_BASED_CLOSE_STAGE1_HOURS', '1.0'))  # Stage 1: after 1 hour
+        self.time_based_close_stage2_hours = float(os.getenv('TIME_BASED_CLOSE_STAGE2_HOURS', '2.0'))  # Stage 2: after 2 hours
+        self.time_based_close_stage3_hours = float(os.getenv('TIME_BASED_CLOSE_STAGE3_HOURS', '3.0'))  # Stage 3: after 3 hours (force close)
+
+        # Stage thresholds
+        self.stage1_close_multiplier = Decimal(os.getenv('STAGE1_CLOSE_MULTIPLIER', '0.2'))  # Stage 1: 20% of open threshold
+        self.stage1_min_spread = Decimal(os.getenv('STAGE1_MIN_SPREAD', '0.3'))  # Stage 1: require 0.3 profit
+
+        self.stage2_close_multiplier = Decimal(os.getenv('STAGE2_CLOSE_MULTIPLIER', '0.1'))  # Stage 2: 10% of open threshold
+        self.stage2_min_spread = Decimal(os.getenv('STAGE2_MIN_SPREAD', '0.0'))  # Stage 2: break-even
+
+        self.stage3_close_multiplier = Decimal(os.getenv('STAGE3_CLOSE_MULTIPLIER', '0.05'))  # Stage 3: 5% of open threshold
+        self.stage3_min_spread = Decimal(os.getenv('STAGE3_MIN_SPREAD', '-0.5'))  # Stage 3: allow small loss
+
+        # Track position open time
+        self.position_open_time = None  # Will be set when position is opened
 
         # Setup callbacks
         self._setup_callbacks()
@@ -366,6 +410,34 @@ class EdgexArb:
         except Exception as e:
             print(f"Error in final data_logger close: {e}")
 
+    def _get_time_based_close_thresholds(self, open_threshold: Decimal) -> tuple:
+        """
+        Calculate close thresholds based on position holding time.
+
+        Returns:
+            tuple: (close_threshold_multiplier, min_close_spread, stage_name)
+        """
+        if not self.enable_time_based_close or self.position_open_time is None:
+            # Time-based close disabled or no position, use default
+            return self.close_threshold_multiplier, self.min_close_spread, "default"
+
+        # Calculate holding time in hours
+        holding_time_hours = (time.time() - self.position_open_time) / 3600.0
+
+        # Determine stage based on holding time
+        if holding_time_hours >= self.time_based_close_stage3_hours:
+            # Stage 3: Force close (allow small loss)
+            return self.stage3_close_multiplier, self.stage3_min_spread, "stage3_force"
+        elif holding_time_hours >= self.time_based_close_stage2_hours:
+            # Stage 2: Break-even close
+            return self.stage2_close_multiplier, self.stage2_min_spread, "stage2_breakeven"
+        elif holding_time_hours >= self.time_based_close_stage1_hours:
+            # Stage 1: Relaxed close (require some profit)
+            return self.stage1_close_multiplier, self.stage1_min_spread, "stage1_relaxed"
+        else:
+            # Before stage 1: Use default (strict)
+            return self.close_threshold_multiplier, self.min_close_spread, "default"
+
     def setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown."""
         signal.signal(signal.SIGINT, self.shutdown)
@@ -604,15 +676,61 @@ class EdgexArb:
 
             lighter_bid, lighter_ask = self.order_book_manager.get_lighter_bbo()
 
-            # Determine if we should trade
+            # Calculate current spreads，每次的价差与阈值比较
+            long_spread = (lighter_bid - ex_best_bid) if (lighter_bid and ex_best_bid) else Decimal('0')
+            short_spread = (ex_best_ask - lighter_ask) if (ex_best_ask and lighter_ask) else Decimal('0')
+
+            # Add spread observation to dynamic threshold calculator
+            if lighter_bid and ex_best_bid and ex_best_ask and lighter_ask:
+                self.dynamic_threshold.add_spread_observation(long_spread, short_spread)
+
+            # Get current thresholds (dynamic or fixed)
+            if self.use_dynamic_threshold:
+                long_threshold, short_threshold = self.dynamic_threshold.get_thresholds()
+            else:
+                long_threshold, short_threshold = self.long_ex_threshold, self.short_ex_threshold
+
+            # Get current position to determine if we're opening or closing
+            current_position = self.position_tracker.get_current_edgex_position()
+
+            # Calculate close thresholds based on holding time (if position exists)
+            if current_position != 0:
+                # Get time-based close thresholds
+                close_multiplier, min_close_spread, stage_name = self._get_time_based_close_thresholds(short_threshold)
+                long_close_threshold = max(long_threshold * close_multiplier, min_close_spread)
+                short_close_threshold = max(short_threshold * close_multiplier, min_close_spread)
+
+                # Calculate holding time for logging
+                holding_time_hours = (time.time() - self.position_open_time) / 3600.0 if self.position_open_time else 0
+            else:
+                # No position, use default close thresholds
+                long_close_threshold = max(long_threshold * self.close_threshold_multiplier, self.min_close_spread)
+                short_close_threshold = max(short_threshold * self.close_threshold_multiplier, self.min_close_spread)
+                stage_name = "default"
+                holding_time_hours = 0
+
+            # Determine if we should trade using current thresholds
             long_ex = False
             short_ex = False
-            if (lighter_bid and ex_best_bid and
-                    lighter_bid - ex_best_bid > self.long_ex_threshold):
+
+            # Long opportunity: buy EdgeX, sell Lighter
+            # - If position <= 0: we're opening or adding to long → use strict threshold
+            # - If position > 0: we're already long, don't add more
+            if lighter_bid and ex_best_bid and long_spread > long_threshold and current_position <= 0:
                 long_ex = True
-            elif (ex_best_ask and lighter_ask and
-                  ex_best_ask - lighter_ask > self.short_ex_threshold):
-                short_ex = True
+
+            # Short opportunity: sell EdgeX, buy Lighter
+            # - If position >= 0: we're closing long or opening short → use relaxed threshold for closing
+            # - If position < 0: we're already short, don't add more
+            elif ex_best_ask and lighter_ask:
+                if current_position > 0:
+                    # We have long position, use relaxed close threshold
+                    if short_spread > short_close_threshold:
+                        short_ex = True
+                elif current_position == 0:
+                    # No position, opening short, use strict threshold
+                    if short_spread > short_threshold:
+                        short_ex = True
 
             # Check if we should log BBO data (only hourly to avoid spam)
             current_time = time.time()
@@ -640,13 +758,19 @@ class EdgexArb:
                 self.last_status_log_time is None or
                 (current_time - self.last_status_log_time >= self.bbo_log_interval)
             ):
-                long_spread = (lighter_bid - ex_best_bid) if (lighter_bid and ex_best_bid) else Decimal('0')
-                short_spread = (ex_best_ask - lighter_ask) if (ex_best_ask and lighter_ask) else Decimal('0')
+                # Get current thresholds for logging
+                if self.use_dynamic_threshold:
+                    current_long_threshold, current_short_threshold = self.dynamic_threshold.get_thresholds()
+                    threshold_mode = "dynamic"
+                else:
+                    current_long_threshold, current_short_threshold = self.long_ex_threshold, self.short_ex_threshold
+                    threshold_mode = "fixed"
+
                 self.logger.info(
                     f"📊 Hourly EX: bid={ex_best_bid}, ask={ex_best_ask} | "
                     f"LT: bid={lighter_bid}, ask={lighter_ask} | "
-                    f"L spread={long_spread:.2f} (threshold={self.long_ex_threshold}), "
-                    f"S spread={short_spread:.2f} (threshold={self.short_ex_threshold}) | "
+                    f"L spread={long_spread:.2f} (threshold={current_long_threshold:.2f} {threshold_mode}), "
+                    f"S spread={short_spread:.2f} (threshold={current_short_threshold:.2f} {threshold_mode}) | "
                     f"EX position={self.position_tracker.get_current_edgex_position()}, "
                     f"LT position={self.position_tracker.lighter_position}"
                 )
@@ -665,7 +789,7 @@ class EdgexArb:
                     # Can execute long trade
                     self.logger.info(
                         f"🔍 [OPPORTUNITY] Long EdgeX detected! "
-                        f"Lighter_bid={lighter_bid} - EdgeX_bid={ex_best_bid} = {spread:.2f} > threshold={self.long_ex_threshold}")
+                        f"Lighter_bid={lighter_bid} - EdgeX_bid={ex_best_bid} = {spread:.2f} > threshold={long_threshold:.2f}")
                     self.logger.info(
                         f"💡 [Strategy] Will BUY on EdgeX @ ~{ex_best_ask} (ask-tick), "
                         f"then SELL on Lighter @ ~{lighter_bid}")
@@ -683,7 +807,7 @@ class EdgexArb:
                             f"📊 [OPPORTUNITY SKIPPED] Long EdgeX - Position limit reached! "
                             f"EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
                             f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
-                            f"Spread={spread:.2f} > threshold={self.long_ex_threshold} | "
+                            f"Spread={spread:.2f} > threshold={long_threshold:.2f} | "
                             f"Position={current_position}/{self.max_position}")
                         self.last_skipped_log_time = current_time
                     self.last_status_log_time = current_time
@@ -692,17 +816,29 @@ class EdgexArb:
             # Check short opportunity
             elif short_ex:
                 spread = ex_best_ask - lighter_ask
+                # Determine if this is a close or open trade
+                is_closing = current_position > 0
+                used_threshold = short_close_threshold if is_closing else short_threshold
+                action_type = "CLOSE LONG" if is_closing else "OPEN SHORT"
+
                 if current_position > -1 * self.max_position:
                     # Can execute short trade
+                    # Build log message with holding time if closing
+                    if is_closing and self.enable_time_based_close:
+                        time_info = f" | Holding: {holding_time_hours:.2f}h ({stage_name})"
+                    else:
+                        time_info = ""
+
                     self.logger.info(
-                        f"🔍 [OPPORTUNITY] Short EdgeX detected! "
-                        f"EdgeX_ask={ex_best_ask} - Lighter_ask={lighter_ask} = {spread:.2f} > threshold={self.short_ex_threshold}")
+                        f"🔍 [OPPORTUNITY] Short EdgeX detected ({action_type})! "
+                        f"EdgeX_ask={ex_best_ask} - Lighter_ask={lighter_ask} = {spread:.2f} > threshold={used_threshold:.2f}{time_info}")
                     self.logger.info(
                         f"💡 [Strategy] Will SELL on EdgeX @ ~{ex_best_bid} (bid+tick), "
                         f"then BUY on Lighter @ ~{lighter_ask}")
                     self.logger.info(
                         f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
-                        f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
+                        f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
+                        f"Current position={current_position}")
                     self.last_status_log_time = current_time  # Reset status log time after trade log
                     # Pass expected prices for validation
                     await self._execute_short_trade(expected_edgex_bid=ex_best_bid, expected_lighter_ask=lighter_ask)
@@ -714,7 +850,7 @@ class EdgexArb:
                             f"📊 [OPPORTUNITY SKIPPED] Short EdgeX - Position limit reached! "
                             f"EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
                             f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
-                            f"Spread={spread:.2f} > threshold={self.short_ex_threshold} | "
+                            f"Spread={spread:.2f} > threshold={short_threshold:.2f} | "
                             f"Position={current_position}/{-1 * self.max_position}")
                         self.last_skipped_log_time = current_time
                     self.last_status_log_time = current_time
@@ -727,6 +863,11 @@ class EdgexArb:
         """Execute a long trade (buy on EdgeX, sell on Lighter)."""
         trade_start_time = time.time()
         self.logger.info(f"⏱️ LONG TRADE START")
+
+        # Record position open time if opening a new position
+        if self.position_tracker.get_current_edgex_position() == 0:
+            self.position_open_time = time.time()
+            self.logger.info(f"📍 Position open time recorded: {self.position_open_time}")
 
         if self.stop_flag:
             return
@@ -803,6 +944,21 @@ class EdgexArb:
         """Execute a short trade (sell on EdgeX, buy on Lighter)."""
         trade_start_time = time.time()
         self.logger.info(f"⏱️ SHORT TRADE START")
+
+        # Check if this is closing a long position or opening a short position
+        current_position = self.position_tracker.get_current_edgex_position()
+        is_closing_long = current_position > 0
+
+        # If opening a new short position, record open time
+        if current_position == 0:
+            self.position_open_time = time.time()
+            self.logger.info(f"📍 Position open time recorded: {self.position_open_time}")
+        # If closing long position, reset open time
+        elif is_closing_long:
+            if self.position_open_time:
+                holding_duration = time.time() - self.position_open_time
+                self.logger.info(f"📍 Closing position held for {holding_duration/3600:.2f} hours")
+            self.position_open_time = None
 
         if self.stop_flag:
             return

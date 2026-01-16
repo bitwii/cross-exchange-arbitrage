@@ -17,6 +17,41 @@ LIGHTER_API_KEY_INDEX=your_api_key_index
 TICKER="BTC"
 ORDER_QTY="0.001"
 
+# 动态阈值配置 (Dynamic Threshold Configuration)
+# 启用动态阈值 (Enable dynamic threshold calculation based on historical spreads)
+USE_DYNAMIC_THRESHOLD=true
+
+# 动态阈值参数 (Dynamic threshold parameters)
+DYNAMIC_THRESHOLD_WINDOW=1000              # 滑动窗口大小 (Number of spread observations to keep)
+DYNAMIC_THRESHOLD_UPDATE_INTERVAL=300      # 更新间隔(秒) (Update interval in seconds, default: 5 minutes)
+DYNAMIC_THRESHOLD_MIN=1.0                  # 最小阈值 (Minimum threshold value)
+DYNAMIC_THRESHOLD_MAX=10.0                 # 最大阈值 (Maximum threshold value)
+DYNAMIC_THRESHOLD_PERCENTILE=0.70          # 使用百分位数 (Percentile to use, 0.70 = 70th percentile)
+
+# 平仓阈值配置 (Close Position Threshold Configuration)
+# 平仓时使用更宽松的阈值，实现"只要不亏就平仓"的策略
+CLOSE_THRESHOLD_MULTIPLIER=0.1             # 平仓阈值倍数 (Close threshold = Open threshold × 0.1, default: 10% of open threshold)
+MIN_CLOSE_SPREAD=0.0                       # 最小平仓价差 (Minimum spread to close position, 0.0 = break-even)
+
+# 基于时间的平仓阈值配置 (Time-Based Close Threshold Configuration)
+# 根据持仓时间逐步放宽平仓条件，避免长期持仓
+ENABLE_TIME_BASED_CLOSE=true               # 启用基于时间的平仓策略 (Enable time-based progressive close strategy)
+
+# 阶段1：持仓1小时后，放宽平仓条件（要求一定利润）
+TIME_BASED_CLOSE_STAGE1_HOURS=1.0          # 阶段1触发时间 (Stage 1: after 1 hour)
+STAGE1_CLOSE_MULTIPLIER=0.2                # 阶段1平仓阈值倍数 (20% of open threshold)
+STAGE1_MIN_SPREAD=0.3                      # 阶段1最小价差 (Require 0.3 profit)
+
+# 阶段2：持仓2小时后，进一步放宽（不亏就平）
+TIME_BASED_CLOSE_STAGE2_HOURS=2.0          # 阶段2触发时间 (Stage 2: after 2 hours)
+STAGE2_CLOSE_MULTIPLIER=0.1                # 阶段2平仓阈值倍数 (10% of open threshold)
+STAGE2_MIN_SPREAD=0.0                      # 阶段2最小价差 (Break-even)
+
+# 阶段3：持仓3小时后，强制平仓（允许小亏）
+TIME_BASED_CLOSE_STAGE3_HOURS=3.0          # 阶段3触发时间 (Stage 3: after 3 hours, force close)
+STAGE3_CLOSE_MULTIPLIER=0.05               # 阶段3平仓阈值倍数 (5% of open threshold)
+STAGE3_MIN_SPREAD=-0.5                     # 阶段3最小价差 (Allow small loss of 0.5)
+
 # StandX 配置 (Solana)
 STANDX_PRIVATE_KEY="你的solana钱包私钥（base58格式）"
 STANDX_BASE_URL="https://perps.standx.com"
