@@ -1,6 +1,7 @@
 这个套利程序从QuantGuy的代码fork而来，做了如下改进：
 1. 之前引用的Lighter SDK已经无法使用，因此修改为适配最新Lighter SDK，同时在requirement.txt也做了更新。因此程序可以直接运行了。
-2. 增加了StandX的支持
+2. 增加了StandX的支持，使用同样的逻辑。
+3. 增加了入口arbitrage2.py
 
 
 
@@ -38,7 +39,7 @@
 
 10%的即时手续费减免；5% 积分加成
 
-#### StandX： YourGuantGuy的邀请没有出来前可以用这个，感谢：
+#### StandX： YourGuantGuy的邀请没有出来前可以用这个邀请，感谢：
 [https://standx.com/referral?code=JAAWW] https://standx.com/referral?code=JAAWW
 
 ---

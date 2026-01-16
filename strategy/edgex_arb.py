@@ -84,7 +84,9 @@ class EdgexArb:
         # BBO logging control (log every hour when no trades)
         self.last_bbo_log_time = None  # None means never logged, will trigger first log
         self.last_status_log_time = None  # None means never logged, will trigger first log
+        self.last_skipped_log_time = None  # Control frequency of "opportunity skipped" logs
         self.bbo_log_interval = 3600  # 1 hour in seconds
+        self.skipped_log_interval = 300  # 5 minutes for skipped opportunity logs
 
         # Price tolerance for trade execution (to avoid stale price trading)
         # If price moves more than this percentage, cancel the trade
@@ -580,19 +582,25 @@ class EdgexArb:
 
         # Main trading loop
         while not self.stop_flag:
-            try:
-                ex_best_bid, ex_best_ask = await asyncio.wait_for(
-                    self.order_manager.fetch_edgex_bbo_prices(),
-                    timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                self.logger.warning("⚠️ Timeout fetching EdgeX BBO prices")
-                await asyncio.sleep(0.5)
-                continue
-            except Exception as e:
-                self.logger.error(f"⚠️ Error fetching EdgeX BBO prices: {e}")
-                await asyncio.sleep(0.5)
-                continue
+            # Optimize: Try to get BBO from WebSocket cache first (synchronous, fast)
+            ex_best_bid, ex_best_ask = self.order_book_manager.get_edgex_bbo()
+
+            # If WebSocket data is not ready, fallback to REST API
+            if not (self.order_book_manager.edgex_order_book_ready and
+                    ex_best_bid and ex_best_ask and ex_best_bid > 0 and ex_best_ask > 0):
+                try:
+                    ex_best_bid, ex_best_ask = await asyncio.wait_for(
+                        self.order_manager.fetch_edgex_bbo_prices(),
+                        timeout=2.0  # Reduced from 5s to 2s
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning("⚠️ Timeout fetching EdgeX BBO prices")
+                    await asyncio.sleep(0.1)  # Reduced from 0.5s to 0.1s
+                    continue
+                except Exception as e:
+                    self.logger.error(f"⚠️ Error fetching EdgeX BBO prices: {e}")
+                    await asyncio.sleep(0.1)  # Reduced from 0.5s to 0.1s
+                    continue
 
             lighter_bid, lighter_ask = self.order_book_manager.get_lighter_bbo()
 
@@ -606,17 +614,15 @@ class EdgexArb:
                   ex_best_ask - lighter_ask > self.short_ex_threshold):
                 short_ex = True
 
-            # Check if we should log BBO data (only when trading or every hour)
+            # Check if we should log BBO data (only hourly to avoid spam)
             current_time = time.time()
             should_log_bbo = (
-                long_ex or short_ex or  # Trading opportunity detected
                 self.last_bbo_log_time is None or  # First time logging
                 (current_time - self.last_bbo_log_time >= self.bbo_log_interval)  # Hourly log
             )
 
             if should_log_bbo:
-                # Log BBO data
-                self.logger.info(f"📝 Logging BBO data (long_ex={long_ex}, short_ex={short_ex}, first_time={self.last_bbo_log_time is None})")
+                # Log BBO data hourly
                 self.data_logger.log_bbo_to_csv(
                     maker_bid=ex_best_bid,
                     maker_ask=ex_best_ask,
@@ -670,13 +676,18 @@ class EdgexArb:
                     # Pass expected prices for validation
                     await self._execute_long_trade(expected_edgex_ask=ex_best_ask, expected_lighter_bid=lighter_bid)
                 else:
-                    # Already at max long position, only log
-                    self.logger.info(
-                        f"📊 [OPPORTUNITY SKIPPED] Long EdgeX opportunity detected but position limit reached! "
-                        f"Spread={spread:.2f} > threshold={self.long_ex_threshold}, "
-                        f"Current position={current_position} >= max={self.max_position}")
+                    # Already at max long position, only log occasionally to avoid spam
+                    if (self.last_skipped_log_time is None or
+                        (current_time - self.last_skipped_log_time >= self.skipped_log_interval)):
+                        self.logger.info(
+                            f"📊 [OPPORTUNITY SKIPPED] Long EdgeX - Position limit reached! "
+                            f"EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                            f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
+                            f"Spread={spread:.2f} > threshold={self.long_ex_threshold} | "
+                            f"Position={current_position}/{self.max_position}")
+                        self.last_skipped_log_time = current_time
                     self.last_status_log_time = current_time
-                    await asyncio.sleep(0.05)
+                    # Removed sleep - continue immediately to check for new opportunities
 
             # Check short opportunity
             elif short_ex:
@@ -696,15 +707,21 @@ class EdgexArb:
                     # Pass expected prices for validation
                     await self._execute_short_trade(expected_edgex_bid=ex_best_bid, expected_lighter_ask=lighter_ask)
                 else:
-                    # Already at max short position, only log
-                    self.logger.info(
-                        f"📊 [OPPORTUNITY SKIPPED] Short EdgeX opportunity detected but position limit reached! "
-                        f"Spread={spread:.2f} > threshold={self.short_ex_threshold}, "
-                        f"Current position={current_position} <= min={-1 * self.max_position}")
+                    # Already at max short position, only log occasionally to avoid spam
+                    if (self.last_skipped_log_time is None or
+                        (current_time - self.last_skipped_log_time >= self.skipped_log_interval)):
+                        self.logger.info(
+                            f"📊 [OPPORTUNITY SKIPPED] Short EdgeX - Position limit reached! "
+                            f"EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
+                            f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
+                            f"Spread={spread:.2f} > threshold={self.short_ex_threshold} | "
+                            f"Position={current_position}/{-1 * self.max_position}")
+                        self.last_skipped_log_time = current_time
                     self.last_status_log_time = current_time
-                    await asyncio.sleep(0.05)
+                    # Removed sleep - continue immediately to check for new opportunities
             else:
-                await asyncio.sleep(0.05)
+                # No opportunity detected, add minimal sleep to prevent busy-waiting
+                await asyncio.sleep(0.01)  # 10ms instead of 50ms
 
     async def _execute_long_trade(self, expected_edgex_ask=None, expected_lighter_bid=None):
         """Execute a long trade (buy on EdgeX, sell on Lighter)."""

@@ -47,6 +47,10 @@ class OrderManager:
         # Callbacks
         self.on_order_filled: Optional[callable] = None
 
+        # WebSocket warning control to avoid spam
+        self.last_ws_warning_time = None
+        self.ws_warning_interval = 60  # Only warn every 60 seconds
+
     def set_edgex_config(self, client: Client, contract_id: str, tick_size: Decimal):
         """Set EdgeX client and configuration."""
         self.edgex_client = client
@@ -81,7 +85,12 @@ class OrderManager:
             return edgex_bid, edgex_ask
 
         # Fallback to REST API if websocket data is not available
-        self.logger.warning("WebSocket BBO data not available, falling back to REST API")
+        # Only log warning every 60 seconds to avoid spam
+        current_time = time.time()
+        if self.last_ws_warning_time is None or (current_time - self.last_ws_warning_time >= self.ws_warning_interval):
+            self.logger.warning("WebSocket BBO data not available, falling back to REST API")
+            self.last_ws_warning_time = current_time
+
         if not self.edgex_client:
             raise Exception("EdgeX client not initialized")
 
