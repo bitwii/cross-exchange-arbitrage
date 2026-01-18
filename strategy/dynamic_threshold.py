@@ -40,9 +40,9 @@ class DynamicThresholdCalculator:
         self.long_spreads = deque(maxlen=window_size)  # lighter_bid - edgex_bid
         self.short_spreads = deque(maxlen=window_size)  # edgex_ask - lighter_ask
 
-        # Current thresholds
-        self.long_threshold = min_threshold
-        self.short_threshold = min_threshold
+        # Current thresholds - start with max_threshold (conservative) until we have enough data
+        self.long_threshold = max_threshold
+        self.short_threshold = max_threshold
 
         # Statistics
         self.last_update_time = time.time()
@@ -71,11 +71,11 @@ class DynamicThresholdCalculator:
     def _update_thresholds(self) -> None:
         """Recalculate thresholds based on current spread history."""
         if len(self.long_spreads) < 100 or len(self.short_spreads) < 100:
-            # Not enough data yet, use minimum threshold
+            # Not enough data yet, keep using maximum threshold (conservative approach)
             self.logger.info(
                 f"📊 [Dynamic Threshold] Insufficient data: "
                 f"long={len(self.long_spreads)}, short={len(self.short_spreads)} samples. "
-                f"Using minimum thresholds."
+                f"Using maximum thresholds (conservative): {self.max_threshold}"
             )
             return
 

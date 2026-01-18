@@ -408,10 +408,10 @@ class EdgexArb:
         # 取消 EdgeX 订单
         try:
             if self.edgex_client:
-                from edgex_sdk import GetOrdersParams
-                params = GetOrdersParams(contract_id=self.edgex_contract_id)
+                from edgex_sdk import GetActiveOrderParams
+                params = GetActiveOrderParams(contract_id=self.edgex_contract_id)
                 orders_result = await asyncio.wait_for(
-                    self.edgex_client.get_orders(params),
+                    self.edgex_client.get_active_orders(params),
                     timeout=5.0
                 )
 
@@ -506,19 +506,30 @@ class EdgexArb:
                             raw_quantity = int(quantity * self.base_amount_multiplier)
                             raw_price = int(close_price * self.price_multiplier)
 
-                            client_order_id = str(int(time.time() * 1000))
+                            client_order_index = int(time.time() * 1000)
 
-                            result = await asyncio.wait_for(
-                                self.lighter_client.create_order(
-                                    self.lighter_market_index,
-                                    raw_price,
-                                    raw_quantity,
-                                    is_ask,
-                                    client_order_id
-                                ),
-                                timeout=10.0
+                            # 使用 sign_create_order + send_tx 方式
+                            tx_type, tx_info, tx_hash, error = self.lighter_client.sign_create_order(
+                                market_index=self.lighter_market_index,
+                                client_order_index=client_order_index,
+                                base_amount=raw_quantity,
+                                price=raw_price,
+                                is_ask=is_ask,
+                                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
+                                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                                reduce_only=False,
+                                trigger_price=0,
+                                order_expiry=self.lighter_client.DEFAULT_IOC_EXPIRY,
                             )
-                            self.logger.info(f"✅ Lighter 平仓订单已提交: {result}")
+                            if error is not None:
+                                raise Exception(f"Sign error: {error}")
+
+                            # Send transaction
+                            await self.lighter_client.send_tx(
+                                tx_type=tx_type,
+                                tx_info=tx_info
+                            )
+                            self.logger.info(f"✅ Lighter 平仓订单已提交: tx_hash={tx_hash}")
                     except Exception as e:
                         self.logger.error(f"❌ Lighter 平仓失败: {e}")
 
@@ -1184,10 +1195,10 @@ class EdgexArb:
 
                 # 检查是否有未完成的订单
                 try:
-                    from edgex_sdk import GetOrdersParams
-                    params = GetOrdersParams(contract_id=self.edgex_contract_id)
+                    from edgex_sdk import GetActiveOrderParams
+                    params = GetActiveOrderParams(contract_id=self.edgex_contract_id)
                     orders_result = await asyncio.wait_for(
-                        self.edgex_client.get_orders(params),
+                        self.edgex_client.get_active_orders(params),
                         timeout=5.0
                     )
 
@@ -1380,10 +1391,10 @@ class EdgexArb:
 
                 # 检查是否有未完成的订单
                 try:
-                    from edgex_sdk import GetOrdersParams
-                    params = GetOrdersParams(contract_id=self.edgex_contract_id)
+                    from edgex_sdk import GetActiveOrderParams
+                    params = GetActiveOrderParams(contract_id=self.edgex_contract_id)
                     orders_result = await asyncio.wait_for(
-                        self.edgex_client.get_orders(params),
+                        self.edgex_client.get_active_orders(params),
                         timeout=5.0
                     )
 

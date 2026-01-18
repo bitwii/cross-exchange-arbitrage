@@ -15,7 +15,7 @@ LIGHTER_API_KEY_INDEX=your_api_key_index
 
 # 交易对与数量
 TICKER="BTC"
-ORDER_QTY="0.001"
+ORDER_QTY="0.01"
 
 # 动态阈值配置 (Dynamic Threshold Configuration)
 # 启用动态阈值 (Enable dynamic threshold calculation based on historical spreads)
