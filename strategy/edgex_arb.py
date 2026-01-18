@@ -122,24 +122,28 @@ class EdgexArb:
 
         # Close threshold configuration (for closing positions with minimal profit)
         # When closing, we use a much lower threshold to allow quick exits
-        self.close_threshold_multiplier = Decimal(os.getenv('CLOSE_THRESHOLD_MULTIPLIER', '0.1'))  # 10% of open threshold
-        self.min_close_spread = Decimal(os.getenv('MIN_CLOSE_SPREAD', '0.0'))  # Minimum spread to close (0 = break-even)
+        # Default stage (< 1h): require reasonable profit
+        self.close_threshold_multiplier = Decimal(os.getenv('CLOSE_THRESHOLD_MULTIPLIER', '0.10'))  # 10% of open threshold
+        self.min_close_spread = Decimal(os.getenv('MIN_CLOSE_SPREAD', '0.15'))  # Minimum spread: 0.15 profit
 
         # Time-based close threshold configuration (progressive relaxation)
         self.enable_time_based_close = os.getenv('ENABLE_TIME_BASED_CLOSE', 'true').lower() == 'true'
         self.time_based_close_stage1_hours = float(os.getenv('TIME_BASED_CLOSE_STAGE1_HOURS', '1.0'))  # Stage 1: after 1 hour
         self.time_based_close_stage2_hours = float(os.getenv('TIME_BASED_CLOSE_STAGE2_HOURS', '2.0'))  # Stage 2: after 2 hours
-        self.time_based_close_stage3_hours = float(os.getenv('TIME_BASED_CLOSE_STAGE3_HOURS', '3.0'))  # Stage 3: after 3 hours (force close)
+        self.time_based_close_stage3_hours = float(os.getenv('TIME_BASED_CLOSE_STAGE3_HOURS', '3.0'))  # Stage 3: after 3 hours
 
-        # Stage thresholds
-        self.stage1_close_multiplier = Decimal(os.getenv('STAGE1_CLOSE_MULTIPLIER', '0.2'))  # Stage 1: 20% of open threshold
-        self.stage1_min_spread = Decimal(os.getenv('STAGE1_MIN_SPREAD', '0.3'))  # Stage 1: require 0.3 profit
+        # Stage thresholds (progressively relaxed)
+        # Stage 1 (1-2h): moderately relaxed
+        self.stage1_close_multiplier = Decimal(os.getenv('STAGE1_CLOSE_MULTIPLIER', '0.08'))  # 8% of open threshold
+        self.stage1_min_spread = Decimal(os.getenv('STAGE1_MIN_SPREAD', '0.10'))  # Minimum spread: 0.10 profit
 
-        self.stage2_close_multiplier = Decimal(os.getenv('STAGE2_CLOSE_MULTIPLIER', '0.1'))  # Stage 2: 10% of open threshold
-        self.stage2_min_spread = Decimal(os.getenv('STAGE2_MIN_SPREAD', '0.0'))  # Stage 2: break-even
+        # Stage 2 (2-3h): break-even acceptable
+        self.stage2_close_multiplier = Decimal(os.getenv('STAGE2_CLOSE_MULTIPLIER', '0.05'))  # 5% of open threshold
+        self.stage2_min_spread = Decimal(os.getenv('STAGE2_MIN_SPREAD', '0.0'))  # Minimum spread: break-even
 
-        self.stage3_close_multiplier = Decimal(os.getenv('STAGE3_CLOSE_MULTIPLIER', '0.05'))  # Stage 3: 5% of open threshold
-        self.stage3_min_spread = Decimal(os.getenv('STAGE3_MIN_SPREAD', '-0.5'))  # Stage 3: allow small loss
+        # Stage 3 (> 3h): break-even (force close)
+        self.stage3_close_multiplier = Decimal(os.getenv('STAGE3_CLOSE_MULTIPLIER', '0.0'))  # 0% - ignore dynamic threshold
+        self.stage3_min_spread = Decimal(os.getenv('STAGE3_MIN_SPREAD', '0.0'))  # Minimum spread: break-even
 
         # Track position open time
         self.position_open_time = None  # Will be set when position is opened
@@ -303,12 +307,27 @@ class EdgexArb:
                 self.logger.info(
                     f"✅ [EdgeX Filled] {side.upper()} {filled_size} @ {price} (order_id={order_id})")
 
+                # Update position and check if we closed a position
                 if side == 'buy':
                     if self.position_tracker:
+                        old_position = self.position_tracker.get_current_edgex_position()
                         self.position_tracker.update_edgex_position(filled_size)
+                        new_position = self.position_tracker.get_current_edgex_position()
+
+                        # If we closed a short position (went from negative to zero or positive), reset open time
+                        if old_position < 0 and new_position >= 0 and self.position_open_time:
+                            self.logger.info(f"✅ [Position Closed] Short position closed, resetting position_open_time")
+                            self.position_open_time = None
                 else:
                     if self.position_tracker:
+                        old_position = self.position_tracker.get_current_edgex_position()
                         self.position_tracker.update_edgex_position(-filled_size)
+                        new_position = self.position_tracker.get_current_edgex_position()
+
+                        # If we closed a long position (went from positive to zero or negative), reset open time
+                        if old_position > 0 and new_position <= 0 and self.position_open_time:
+                            self.logger.info(f"✅ [Position Closed] Long position closed, resetting position_open_time")
+                            self.position_open_time = None
 
                 self.logger.info(
                     f"[{order_id}] [{order_type}] [EdgeX] [{status}]: {filled_size} @ {price}")
@@ -1294,12 +1313,11 @@ class EdgexArb:
         if current_position == 0:
             self.position_open_time = time.time()
             self.logger.info(f"📍 Position open time recorded: {self.position_open_time}")
-        # If closing long position, reset open time
+        # If closing long position, log holding duration (but don't reset yet - wait for successful fill)
         elif is_closing_long:
             if self.position_open_time:
                 holding_duration = time.time() - self.position_open_time
                 self.logger.info(f"📍 Closing position held for {holding_duration/3600:.2f} hours")
-            self.position_open_time = None
 
         if self.stop_flag:
             return
