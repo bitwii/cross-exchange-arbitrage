@@ -12,6 +12,7 @@ __pycache__/
 env/
 venv/
 ENV/
+crarbenv/
 build/
 develop-eggs/
 dist/
