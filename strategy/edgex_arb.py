@@ -105,6 +105,10 @@ class EdgexArb:
         self.bbo_log_interval = 3600  # 1 hour in seconds
         self.skipped_log_interval = 300  # 5 minutes for skipped opportunity logs
 
+        # Position sync control (verify cached positions match actual positions)
+        self.last_position_sync_time = None
+        self.position_sync_interval = 60  # Sync every 60 seconds
+
         # Price tolerance for trade execution (to avoid stale price trading)
         # If price moves more than this percentage, cancel the trade
         self.price_tolerance_pct = Decimal('0.05')  # 0.05% price change tolerance
@@ -816,6 +820,42 @@ class EdgexArb:
 
         # Main trading loop
         while not self.stop_flag:
+            # 定期同步持仓（每60秒验证一次缓存的持仓与实际持仓是否一致）
+            current_time = time.time()
+            if self.last_position_sync_time is None or (current_time - self.last_position_sync_time >= self.position_sync_interval):
+                try:
+                    actual_edgex_pos = await self.position_tracker.get_edgex_position()
+                    actual_lighter_pos = await self.position_tracker.get_lighter_position()
+
+                    cached_edgex_pos = self.position_tracker.get_current_edgex_position()
+                    cached_lighter_pos = self.position_tracker.get_current_lighter_position()
+
+                    # 检查缓存持仓与实际持仓的差异
+                    edgex_diff = abs(actual_edgex_pos - cached_edgex_pos)
+                    lighter_diff = abs(actual_lighter_pos - cached_lighter_pos)
+
+                    if edgex_diff > Decimal('0.01') or lighter_diff > Decimal('0.01'):
+                        self.logger.warning(
+                            f"⚠️ [Position Sync] Cached vs Actual mismatch detected!")
+                        self.logger.warning(
+                            f"   EdgeX: cached={cached_edgex_pos}, actual={actual_edgex_pos}, diff={edgex_diff}")
+                        self.logger.warning(
+                            f"   Lighter: cached={cached_lighter_pos}, actual={actual_lighter_pos}, diff={lighter_diff}")
+                        self.logger.warning(
+                            f"   Updating cached positions to match actual positions...")
+
+                        # 更新缓存持仓为实际持仓
+                        self.position_tracker.edgex_position = actual_edgex_pos
+                        self.position_tracker.lighter_position = actual_lighter_pos
+                    else:
+                        self.logger.info(
+                            f"✅ [Position Sync] Cached positions match actual positions: "
+                            f"EdgeX={actual_edgex_pos}, Lighter={actual_lighter_pos}")
+
+                    self.last_position_sync_time = current_time
+                except Exception as e:
+                    self.logger.error(f"❌ [Position Sync] Failed to sync positions: {e}")
+
             # 检查持仓平衡（每次循环都检查）
             edgex_pos = self.position_tracker.get_current_edgex_position()
             lighter_pos = self.position_tracker.get_current_lighter_position()
@@ -1169,6 +1209,70 @@ class EdgexArb:
         total_time = time.time() - trade_start_time
         self.logger.info(f"⏱️ LONG TRADE TOTAL EXECUTION: {total_time:.3f}s")
 
+        # 交易完成后验证持仓平衡
+        await self._verify_position_balance_after_trade("LONG")
+
+    async def _verify_position_balance_after_trade(self, trade_type: str):
+        """验证交易完成后的持仓平衡."""
+        try:
+            # 等待一小段时间让订单状态更新
+            await asyncio.sleep(1)
+
+            # 获取实际持仓
+            actual_edgex_pos = await self.position_tracker.get_edgex_position()
+            actual_lighter_pos = await self.position_tracker.get_lighter_position()
+
+            # 获取缓存持仓
+            cached_edgex_pos = self.position_tracker.get_current_edgex_position()
+            cached_lighter_pos = self.position_tracker.get_current_lighter_position()
+
+            # 计算差异
+            edgex_diff = abs(actual_edgex_pos - cached_edgex_pos)
+            lighter_diff = abs(actual_lighter_pos - cached_lighter_pos)
+            actual_net = actual_edgex_pos + actual_lighter_pos
+            cached_net = cached_edgex_pos + cached_lighter_pos
+
+            self.logger.info(
+                f"📊 [{trade_type} Trade Verification] "
+                f"Cached: EdgeX={cached_edgex_pos}, Lighter={cached_lighter_pos}, Net={cached_net}")
+            self.logger.info(
+                f"📊 [{trade_type} Trade Verification] "
+                f"Actual: EdgeX={actual_edgex_pos}, Lighter={actual_lighter_pos}, Net={actual_net}")
+
+            # 如果有差异，更新缓存并警告
+            if edgex_diff > Decimal('0.01') or lighter_diff > Decimal('0.01'):
+                self.logger.warning(
+                    f"⚠️ [{trade_type} Trade Verification] Position mismatch detected!")
+                self.logger.warning(
+                    f"   EdgeX diff: {edgex_diff}, Lighter diff: {lighter_diff}")
+                self.logger.warning(
+                    f"   Updating cached positions to match actual...")
+
+                # 更新缓存
+                self.position_tracker.edgex_position = actual_edgex_pos
+                self.position_tracker.lighter_position = actual_lighter_pos
+
+            # 检查净持仓是否平衡
+            if abs(actual_net) > Decimal('0.05'):
+                self.logger.warning(
+                    f"⚠️ [{trade_type} Trade Verification] Net position imbalance: {actual_net}")
+
+                # 检查是否是裸仓（两个交易所持仓方向相同）
+                if (actual_edgex_pos < -Decimal('0.01') and actual_lighter_pos < -Decimal('0.01')) or \
+                   (actual_edgex_pos > Decimal('0.01') and actual_lighter_pos > Decimal('0.01')):
+                    self.logger.error(
+                        f"🚨 [{trade_type} Trade Verification] NAKED POSITION DETECTED!")
+                    self.logger.error(
+                        f"   EdgeX={actual_edgex_pos}, Lighter={actual_lighter_pos}")
+                    self.logger.error(
+                        f"   This is a high-risk state! Consider manual intervention.")
+            else:
+                self.logger.info(
+                    f"✅ [{trade_type} Trade Verification] Positions are balanced (net={actual_net})")
+
+        except Exception as e:
+            self.logger.error(f"❌ [{trade_type} Trade Verification] Failed: {e}")
+
     async def _execute_short_trade(self, expected_edgex_bid=None, expected_lighter_ask=None):
         """Execute a short trade (sell on EdgeX, buy on Lighter)."""
         trade_start_time = time.time()
@@ -1301,6 +1405,9 @@ class EdgexArb:
 
         total_time = time.time() - trade_start_time
         self.logger.info(f"⏱️ SHORT TRADE TOTAL EXECUTION: {total_time:.3f}s")
+
+        # 交易完成后验证持仓平衡
+        await self._verify_position_balance_after_trade("SHORT")
 
     async def run(self):
         """Run the arbitrage bot."""

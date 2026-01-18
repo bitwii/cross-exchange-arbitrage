@@ -252,16 +252,20 @@ class OrderManager:
         if lighter_side.lower() == 'buy':
             order_type = "CLOSE"
             is_ask = False
-            price = best_ask[0] * Decimal('1.002')
+            # Lighter 没有手续费，使用更激进的价格确保立即成交（taker）
+            # 直接使用卖一价加上一定滑点，确保吃掉卖单
+            price = best_ask[0] * Decimal('1.005')  # 增加到 0.5% 滑点确保成交
             self.logger.info(
-                f"📊 [Buy Order] Price adjustment: best_ask({best_ask[0]}) × 1.002 = {price} "
+                f"📊 [Buy Order - Taker] Price adjustment: best_ask({best_ask[0]}) × 1.005 = {price} "
                 f"(EdgeX reference price: {original_price})")
         else:
             order_type = "OPEN"
             is_ask = True
-            price = best_bid[0] * Decimal('0.998')
+            # Lighter 没有手续费，使用更激进的价格确保立即成交（taker）
+            # 直接使用买一价减去一定滑点，确保吃掉买单
+            price = best_bid[0] * Decimal('0.995')  # 减少到 0.5% 滑点确保成交
             self.logger.info(
-                f"📊 [Sell Order] Price adjustment: best_bid({best_bid[0]}) × 0.998 = {price} "
+                f"📊 [Sell Order - Taker] Price adjustment: best_bid({best_bid[0]}) × 0.995 = {price} "
                 f"(EdgeX reference price: {original_price})")
 
         self.lighter_order_filled = False
@@ -276,7 +280,7 @@ class OrderManager:
             price_raw = int(price * self.price_multiplier)
 
             self.logger.info(
-                f"📤 [Sending Order] Lighter {lighter_side.upper()} order: "
+                f"📤 [Sending Order] Lighter {lighter_side.upper()} order (IOC - Taker): "
                 f"quantity={quantity} (raw={base_amount_raw}), "
                 f"price={price} (raw={price_raw}), "
                 f"is_ask={is_ask}, client_order_id={client_order_index}")
@@ -288,7 +292,7 @@ class OrderManager:
                 price=price_raw,
                 is_ask=is_ask,
                 order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,  # 使用 IOC 确保立即成交
                 reduce_only=False,
                 trigger_price=0,
             )
