@@ -295,6 +295,7 @@ class OrderManager:
                 time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,  # 使用 IOC 确保立即成交
                 reduce_only=False,
                 trigger_price=0,
+                order_expiry=self.lighter_client.DEFAULT_IOC_EXPIRY,  # IOC 订单必须使用 0 作为 expiry
             )
             if error is not None:
                 raise Exception(f"Sign error: {error}")

@@ -109,6 +109,10 @@ class EdgexArb:
         self.last_position_sync_time = None
         self.position_sync_interval = 60  # Sync every 60 seconds
 
+        # Position imbalance warning control (avoid log spam)
+        self.last_imbalance_warning_time = None
+        self.imbalance_warning_interval = 10  # Warn every 10 seconds
+
         # Price tolerance for trade execution (to avoid stale price trading)
         # If price moves more than this percentage, cancel the trade
         self.price_tolerance_pct = Decimal('0.05')  # 0.05% price change tolerance
@@ -876,10 +880,14 @@ class EdgexArb:
                     await asyncio.sleep(60)  # 暂停60秒
                     continue
 
-                # 如果净持仓不为0但不是裸仓，只是警告
+                # 如果净持仓不为0但不是裸仓，只是警告（控制警告频率）
                 if abs(net_position) > self.order_quantity * Decimal('0.5'):
-                    self.logger.warning(
-                        f"⚠️ [Position Imbalance] EdgeX={edgex_pos}, Lighter={lighter_pos}, Net={net_position}")
+                    current_time = time.time()
+                    if self.last_imbalance_warning_time is None or \
+                       (current_time - self.last_imbalance_warning_time >= self.imbalance_warning_interval):
+                        self.logger.warning(
+                            f"⚠️ [Position Imbalance] EdgeX={edgex_pos}, Lighter={lighter_pos}, Net={net_position}")
+                        self.last_imbalance_warning_time = current_time
 
             # Optimize: Try to get BBO from WebSocket cache first (synchronous, fast)
             ex_best_bid, ex_best_ask = self.order_book_manager.get_edgex_bbo()
