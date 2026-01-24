@@ -22,6 +22,7 @@ rsync -avz \
   --exclude '.env' \
   --exclude 'logs/'\
   --exclude 'crarbenv/' \
+  --exclude 'env/'\
   --exclude 'deploy.sh' \
   ./ $REMOTE_HOST:$REMOTE_DIR
 

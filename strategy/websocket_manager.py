@@ -123,14 +123,14 @@ class WebSocketManagerWrapper:
             # Connect to EdgeX WebSocket
             self.edgex_ws_manager.connect_public()
             self.edgex_ws_manager.connect_private()
-            self.logger.info("✅ EdgeX WebSocket connection established")
+            # self.logger.info("✅ EdgeX WebSocket connection established")
 
             # Setup public client for market data
             public_client = self.edgex_ws_manager.get_public_client()
 
             # Register handler for depth messages
             public_client.on_message("depth", self.handle_edgex_order_book_update)
-            self.logger.info("✅ EdgeX WebSocket depth handler registered")
+            # self.logger.info("✅ EdgeX WebSocket depth handler registered")
 
             # Subscribe to depth channel after connection is established
             public_client.subscribe(f"depth.{self.edgex_contract_id}.15")

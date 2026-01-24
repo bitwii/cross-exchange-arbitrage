@@ -409,7 +409,7 @@ class EdgexArb:
         try:
             if self.edgex_client:
                 from edgex_sdk import GetActiveOrderParams
-                params = GetActiveOrderParams(contract_id=self.edgex_contract_id)
+                params = GetActiveOrderParams(size="200", offset_data="", filter_contract_id_list=[self.edgex_contract_id])
                 orders_result = await asyncio.wait_for(
                     self.edgex_client.get_active_orders(params),
                     timeout=5.0
@@ -533,16 +533,29 @@ class EdgexArb:
                     except Exception as e:
                         self.logger.error(f"❌ Lighter 平仓失败: {e}")
 
-                # 等待订单成交
-                await asyncio.sleep(3)
+                # 等待订单成交（增加等待时间，并多次检查）
+                self.logger.info("⏳ 等待平仓订单成交...")
+                for i in range(3):  # 最多等待15秒（3次 x 5秒）
+                    await asyncio.sleep(5)
 
-                # 再次检查持仓
+                    # 检查持仓
+                    edgex_pos_check = await self.position_tracker.get_edgex_position()
+                    lighter_pos_check = await self.position_tracker.get_lighter_position()
+
+                    if abs(edgex_pos_check) <= Decimal('0.001') and abs(lighter_pos_check) <= Decimal('0.001'):
+                        self.logger.info(f"✅ 第{i+1}次检查：持仓已完全平仓")
+                        break
+                    else:
+                        self.logger.info(f"⏳ 第{i+1}次检查：EdgeX={edgex_pos_check}, Lighter={lighter_pos_check}，继续等待...")
+
+                # 最终检查持仓
                 edgex_pos_after = await self.position_tracker.get_edgex_position()
                 lighter_pos_after = await self.position_tracker.get_lighter_position()
                 self.logger.info(f"📊 平仓后持仓: EdgeX={edgex_pos_after}, Lighter={lighter_pos_after}")
 
                 if abs(edgex_pos_after) > Decimal('0.001') or abs(lighter_pos_after) > Decimal('0.001'):
                     self.logger.error(f"⚠️ 警告：仓位未完全平仓！请手动检查！")
+                    self.logger.error(f"⚠️ 残留持仓: EdgeX={edgex_pos_after}, Lighter={lighter_pos_after}")
             else:
                 self.logger.info("✅ 持仓已平衡，无需平仓")
 
@@ -592,6 +605,19 @@ class EdgexArb:
                 self.edgex_ws_manager.disconnect_all()
         except Exception as e:
             self.logger.error(f"Error disconnecting EdgeX WebSocket manager: {e}")
+
+        # Cancel and wait for Lighter WebSocket task to complete
+        try:
+            if self.ws_manager and self.ws_manager.lighter_ws_task and not self.ws_manager.lighter_ws_task.done():
+                self.ws_manager.lighter_ws_task.cancel()
+                try:
+                    await asyncio.wait_for(self.ws_manager.lighter_ws_task, timeout=2.0)
+                except asyncio.CancelledError:
+                    self.logger.info("🔌 Lighter WebSocket task cancelled successfully")
+                except asyncio.TimeoutError:
+                    self.logger.warning("⚠️ Timeout waiting for Lighter WebSocket task to cancel")
+        except Exception as e:
+            self.logger.error(f"Error cancelling Lighter WebSocket task: {e}")
 
         # Flush all logging handlers before exit
         try:
@@ -686,7 +712,15 @@ class EdgexArb:
 
         self.logger.info("✅ EdgeX client initialized successfully")
         return self.edgex_client
-
+    
+    """ 
+    获取所有订单簿信息，然后提取挂着的信息
+    返回值：-> Tuple[int, int, int, Decimal]: 类型提示，表示函数将返回一个包含 4 个元素的元组：
+    int: 市场 ID (market_id)。
+    int: 数量精度倍数 (size multiplier)。，如果supported_size_decimals是2，则数量精度倍数是10的2次方，即100，将人类可读数量转换为交易所内部表示
+    int: 价格精度倍数 (price multiplier)。计算价格的精度因子，如果是-2,那么价格精度倍数是10的-2次方，即0.01，将人类可读价格转换为交易所内部表示
+    Decimal: 最小价格变动单位 (tick size)。也是表示精度的因子
+    """
     def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal]:
         """Get Lighter market configuration."""
         url = f"{self.lighter_base_url}/api/v1/orderBooks"
@@ -717,6 +751,8 @@ class EdgexArb:
             self.logger.error(f"⚠️ Error getting market config: {e}")
             raise
 
+    # 获取Edgex合约的ID和最小变动价位tick size， 检查下单数量是否符合最小要求
+    # contractid是Edgex交易所规定的内部id，对应着某个币与美元的合约
     async def get_edgex_contract_info(self) -> Tuple[str, Decimal]:
         """Get EdgeX contract ID and tick size."""
         if not self.edgex_client:
@@ -759,14 +795,14 @@ class EdgexArb:
             self.initialize_lighter_client()
             self.initialize_edgex_client()
 
-            # Get contract info
+            # Get contract info， 交易所规定的合约id，tick size,以及最小交易量约束
             self.edgex_contract_id, self.edgex_tick_size = await self.get_edgex_contract_info()
             (self.lighter_market_index, self.base_amount_multiplier,
              self.price_multiplier, self.tick_size) = self.get_lighter_market_config()
 
             self.logger.info(
-                f"Contract info loaded - EdgeX: {self.edgex_contract_id}, "
-                f"Lighter: {self.lighter_market_index}")
+                f"Contract info loaded - EdgeX: {self.edgex_contract_id},{self.edgex_tick_size} "
+                f"Lighter: {self.lighter_market_index}，{self.price_multiplier}, tick size: {self.tick_size}")
 
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize: {e}")
@@ -1169,8 +1205,14 @@ class EdgexArb:
         try:
             side = 'buy'
             order_start = time.time()
+            # 获取当前动态阈值用于价差监控
+            if self.use_dynamic_threshold and self.dynamic_threshold:
+                current_long_th, _ = self.dynamic_threshold.get_thresholds()
+            else:
+                current_long_th = self.long_ex_threshold
             order_filled = await self.order_manager.place_edgex_post_only_order(
-                side, self.order_quantity, self.stop_flag)
+                side, self.order_quantity, self.stop_flag,
+                arb_direction='long', threshold=current_long_th)
             order_time = time.time() - order_start
             self.logger.info(f"⏱️ EdgeX order placement: {order_time:.3f}s")
 
@@ -1194,9 +1236,11 @@ class EdgexArb:
                 await asyncio.sleep(2)
 
                 # 检查是否有未完成的订单
+                timeout_order_found = False
+                timeout_order_id = None
                 try:
-                    from edgex_sdk import GetActiveOrderParams
-                    params = GetActiveOrderParams(contract_id=self.edgex_contract_id)
+                    from edgex_sdk import GetActiveOrderParams, CancelOrderParams
+                    params = GetActiveOrderParams(size="200", offset_data="", filter_contract_id_list=[self.edgex_contract_id])
                     orders_result = await asyncio.wait_for(
                         self.edgex_client.get_active_orders(params),
                         timeout=5.0
@@ -1209,16 +1253,55 @@ class EdgexArb:
 
                         if recent_orders:
                             order = recent_orders[0]
+                            timeout_order_found = True
+                            timeout_order_id = order['orderId']
                             self.logger.warning(
-                                f"⚠️ 发现相关订单: ID={order['orderId']}, "
+                                f"⚠️ 发现超时订单: ID={order['orderId']}, "
                                 f"状态={order['status']}, "
                                 f"价格={order['price']}, "
                                 f"数量={order['size']}"
                             )
+
+                            # 如果订单还在挂单状态，尝试取消
+                            if order['status'] in ['NEW', 'OPEN', 'PENDING']:
+                                self.logger.warning(f"⚠️ 尝试取消超时订单 {timeout_order_id}...")
+                                try:
+                                    cancel_params = CancelOrderParams(order_id=timeout_order_id)
+                                    await asyncio.wait_for(
+                                        self.edgex_client.cancel_order(cancel_params),
+                                        timeout=3.0
+                                    )
+                                    self.logger.info(f"✅ 已取消超时订单 {timeout_order_id}")
+                                except Exception as cancel_error:
+                                    self.logger.error(f"❌ 取消超时订单失败: {cancel_error}")
+
+                            # 等待订单状态更新（成交或取消）
+                            self.logger.info("⏳ 等待超时订单状态更新...")
+                            for i in range(6):  # 最多等待6秒
+                                await asyncio.sleep(1)
+                                # 通过 WebSocket 更新应该已经到达
+                                # 检查订单是否已经不在 active orders 中
+                                check_result = await asyncio.wait_for(
+                                    self.edgex_client.get_active_orders(params),
+                                    timeout=3.0
+                                )
+                                if check_result and 'data' in check_result:
+                                    check_orders = check_result['data'].get('orderList', [])
+                                    still_active = [o for o in check_orders if o['orderId'] == timeout_order_id]
+                                    if not still_active:
+                                        self.logger.info(f"✅ 超时订单 {timeout_order_id} 已处理完成")
+                                        break
+                                    else:
+                                        self.logger.info(f"⏳ 第{i+1}次检查：超时订单仍在处理中...")
                         else:
                             self.logger.info("✅ 未发现相关的挂单")
                 except Exception as check_error:
                     self.logger.error(f"❌ 检查订单状态失败: {check_error}")
+
+                # 再次等待，确保持仓更新
+                if timeout_order_found:
+                    self.logger.info("⏳ 等待持仓更新...")
+                    await asyncio.sleep(2)
 
             # 触发关闭流程
             self.logger.error("🛑 由于错误，触发关闭流程...")
@@ -1365,8 +1448,14 @@ class EdgexArb:
         try:
             side = 'sell'
             order_start = time.time()
+            # 获取当前动态阈值用于价差监控
+            if self.use_dynamic_threshold and self.dynamic_threshold:
+                _, current_short_th = self.dynamic_threshold.get_thresholds()
+            else:
+                current_short_th = self.short_ex_threshold
             order_filled = await self.order_manager.place_edgex_post_only_order(
-                side, self.order_quantity, self.stop_flag)
+                side, self.order_quantity, self.stop_flag,
+                arb_direction='short', threshold=current_short_th)
             order_time = time.time() - order_start
             self.logger.info(f"⏱️ EdgeX order placement: {order_time:.3f}s")
 
@@ -1390,9 +1479,11 @@ class EdgexArb:
                 await asyncio.sleep(2)
 
                 # 检查是否有未完成的订单
+                timeout_order_found = False
+                timeout_order_id = None
                 try:
-                    from edgex_sdk import GetActiveOrderParams
-                    params = GetActiveOrderParams(contract_id=self.edgex_contract_id)
+                    from edgex_sdk import GetActiveOrderParams, CancelOrderParams
+                    params = GetActiveOrderParams(size="200", offset_data="", filter_contract_id_list=[self.edgex_contract_id])
                     orders_result = await asyncio.wait_for(
                         self.edgex_client.get_active_orders(params),
                         timeout=5.0
@@ -1405,16 +1496,55 @@ class EdgexArb:
 
                         if recent_orders:
                             order = recent_orders[0]
+                            timeout_order_found = True
+                            timeout_order_id = order['orderId']
                             self.logger.warning(
-                                f"⚠️ 发现相关订单: ID={order['orderId']}, "
+                                f"⚠️ 发现超时订单: ID={order['orderId']}, "
                                 f"状态={order['status']}, "
                                 f"价格={order['price']}, "
                                 f"数量={order['size']}"
                             )
+
+                            # 如果订单还在挂单状态，尝试取消
+                            if order['status'] in ['NEW', 'OPEN', 'PENDING']:
+                                self.logger.warning(f"⚠️ 尝试取消超时订单 {timeout_order_id}...")
+                                try:
+                                    cancel_params = CancelOrderParams(order_id=timeout_order_id)
+                                    await asyncio.wait_for(
+                                        self.edgex_client.cancel_order(cancel_params),
+                                        timeout=3.0
+                                    )
+                                    self.logger.info(f"✅ 已取消超时订单 {timeout_order_id}")
+                                except Exception as cancel_error:
+                                    self.logger.error(f"❌ 取消超时订单失败: {cancel_error}")
+
+                            # 等待订单状态更新（成交或取消）
+                            self.logger.info("⏳ 等待超时订单状态更新...")
+                            for i in range(6):  # 最多等待6秒
+                                await asyncio.sleep(1)
+                                # 通过 WebSocket 更新应该已经到达
+                                # 检查订单是否已经不在 active orders 中
+                                check_result = await asyncio.wait_for(
+                                    self.edgex_client.get_active_orders(params),
+                                    timeout=3.0
+                                )
+                                if check_result and 'data' in check_result:
+                                    check_orders = check_result['data'].get('orderList', [])
+                                    still_active = [o for o in check_orders if o['orderId'] == timeout_order_id]
+                                    if not still_active:
+                                        self.logger.info(f"✅ 超时订单 {timeout_order_id} 已处理完成")
+                                        break
+                                    else:
+                                        self.logger.info(f"⏳ 第{i+1}次检查：超时订单仍在处理中...")
                         else:
                             self.logger.info("✅ 未发现相关的挂单")
                 except Exception as check_error:
                     self.logger.error(f"❌ 检查订单状态失败: {check_error}")
+
+                # 再次等待，确保持仓更新
+                if timeout_order_found:
+                    self.logger.info("⏳ 等待持仓更新...")
+                    await asyncio.sleep(2)
 
             # 触发关闭流程
             self.logger.error("🛑 由于错误，触发关闭流程...")
@@ -1459,9 +1589,9 @@ class EdgexArb:
         finally:
             self.logger.info("🔄 Cleaning up...")
             self.shutdown()
-            # Ensure async cleanup is done with timeout (增加到60秒以便有足够时间平仓)
+            # Ensure async cleanup is done with timeout (增加到90秒以便有足够时间取消订单和平仓)
             try:
-                await asyncio.wait_for(self._async_cleanup(), timeout=60.0)
+                await asyncio.wait_for(self._async_cleanup(), timeout=90.0)
             except asyncio.TimeoutError:
                 self.logger.warning("⚠️ Cleanup timeout, forcing exit")
                 self.logger.error("⚠️ 警告：清理超时！请手动检查订单和持仓状态！")

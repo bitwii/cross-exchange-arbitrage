@@ -154,8 +154,17 @@ class OrderManager:
 
         return order_id
 
-    async def place_edgex_post_only_order(self, side: str, quantity: Decimal, stop_flag) -> bool:
-        """Place a post-only order on EdgeX."""
+    async def place_edgex_post_only_order(self, side: str, quantity: Decimal, stop_flag,
+                                          arb_direction: str = None, threshold: Decimal = None) -> bool:
+        """Place a post-only order on EdgeX.
+
+        Args:
+            side: 'buy' or 'sell'
+            quantity: order quantity
+            stop_flag: flag to stop the order
+            arb_direction: 'long' or 'short' - used for spread monitoring
+            threshold: spread threshold - if spread drops below this, cancel order
+        """
         if not self.edgex_client:
             raise Exception("EdgeX client not initialized")
 
@@ -164,24 +173,46 @@ class OrderManager:
         order_id = await self.place_bbo_order(side, quantity)
 
         start_time = time.time()
+        spread_check_interval = 0.2  # Check spread every 200ms
+        last_spread_check = time.time()
+
+        cancel_requested = False  # Track if we've requested cancellation
+
         while not stop_flag:
+            # Check if spread has disappeared (only if arb_direction and threshold provided)
+            if arb_direction and threshold and time.time() - last_spread_check >= spread_check_interval:
+                last_spread_check = time.time()
+                spread_gone = await self._check_spread_disappeared(arb_direction, threshold)
+                if spread_gone and self.edgex_order_status in ['NEW', 'OPEN', 'PENDING'] and not cancel_requested:
+                    self.logger.warning(
+                        f"⚠️ [Spread Disappeared] Canceling order {order_id} - "
+                        f"spread no longer meets threshold {threshold}")
+                    try:
+                        cancel_params = CancelOrderParams(order_id=order_id)
+                        await self.edgex_client.cancel_order(cancel_params)
+                        cancel_requested = True
+                        self.logger.info(f"✅ [Spread Cancel] Order {order_id} canceled due to spread disappearance")
+                        # Don't return immediately - wait for status confirmation
+                    except Exception as e:
+                        self.logger.error(f"❌ Error canceling order on spread disappearance: {e}")
+
+            # CANCELED with no fill - truly canceled, return False
+            # Note: CANCELED with fill is converted to FILLED by edgex_arb._handle_edgex_order_update
             if self.edgex_order_status == 'CANCELED':
-                # Log current market price when order is cancelled
                 try:
                     current_bid, current_ask = await self.fetch_edgex_bbo_prices()
                     self.logger.warning(
-                        f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled. "
-                        f"Reason: Order was not filled within timeout period or was canceled by exchange. "
-                        f"Market BBO at cancellation: bid={current_bid}, ask={current_ask}")
+                        f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled (no fill). "
+                        f"Market BBO: bid={current_bid}, ask={current_ask}")
                 except Exception as e:
                     self.logger.warning(
-                        f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled. "
-                        f"Reason: Order was not filled within timeout period or was canceled by exchange. "
-                        f"(Failed to fetch current market price: {e})")
+                        f"⚠️ [EdgeX Order CANCELED] Order {order_id} was canceled (no fill). "
+                        f"(Failed to fetch BBO: {e})")
                 return False
-            elif self.edgex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
+            elif self.edgex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING']:
                 await asyncio.sleep(0.5)
-                if time.time() - start_time > 5:
+                # Only timeout if we haven't requested cancellation due to spread disappearance
+                if time.time() - start_time > 5 and not cancel_requested:
                     elapsed = time.time() - start_time
                     # Fetch current market price at timeout
                     try:
@@ -204,6 +235,17 @@ class OrderManager:
                             self.logger.info(f"✅ [EdgeX Order Cancel Request Sent] Order {order_id} cancel request successful")
                     except Exception as e:
                         self.logger.error(f"❌ Error canceling EdgeX order: {e}")
+                # Timeout for spread-cancel: wait max 3s for status confirmation
+                elif cancel_requested and time.time() - start_time > 8:
+                    self.logger.warning(
+                        f"⚠️ [Spread Cancel Timeout] Waited too long for status after cancel request. "
+                        f"Current status: {self.edgex_order_status}")
+                    return False
+            # PARTIALLY_FILLED is a terminal state with partial execution - treat as success
+            elif self.edgex_order_status == 'PARTIALLY_FILLED':
+                self.logger.info(
+                    f"✅ [EdgeX Partial Fill] Order {order_id} partially filled, proceeding with hedge")
+                break
             elif self.edgex_order_status == 'FILLED':
                 break
             else:
@@ -233,6 +275,39 @@ class OrderManager:
     def update_edgex_order_status(self, status: str):
         """Update EdgeX order status."""
         self.edgex_order_status = status
+
+    async def _check_spread_disappeared(self, arb_direction: str, threshold: Decimal) -> bool:
+        """Check if the arbitrage spread has disappeared.
+
+        Args:
+            arb_direction: 'long' or 'short'
+            threshold: minimum spread required
+
+        Returns:
+            True if spread has disappeared (below threshold), False otherwise
+        """
+        try:
+            edgex_bid, edgex_ask = self.order_book_manager.get_edgex_bbo()
+            lighter_bid, lighter_ask = self.order_book_manager.get_lighter_bbo()
+
+            if not all([edgex_bid, edgex_ask, lighter_bid, lighter_ask]):
+                return False  # Can't determine, don't cancel
+
+            if arb_direction == 'long':
+                # Long: Lighter bid > EdgeX ask + threshold
+                current_spread = lighter_bid - edgex_ask
+            else:  # short
+                # Short: EdgeX bid > Lighter ask + threshold
+                current_spread = edgex_bid - lighter_ask
+
+            if current_spread < threshold:
+                self.logger.debug(
+                    f"📉 [Spread Check] {arb_direction} spread={current_spread:.2f} < threshold={threshold}")
+                return True
+            return False
+        except Exception as e:
+            self.logger.debug(f"Error checking spread: {e}")
+            return False  # On error, don't cancel
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal,
                                          price: Decimal, stop_flag) -> Optional[str]:
