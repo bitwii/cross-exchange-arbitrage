@@ -103,6 +103,9 @@ class StandxArb:
         # Price tolerance
         self.price_tolerance_pct = Decimal('0.05')
 
+        # Current active order tracking (to filter stale order updates)
+        self.current_order_id = None
+
         # Setup callbacks
         self._setup_callbacks()
 
@@ -220,19 +223,23 @@ class StandxArb:
         Triggered by StandXClient.
         """
         try:
-            # 过滤合约
-            if order.get('contract_id') and order.get('contract_id') != self.standx_symbol:
+            # 打印原始订单数据用于调试
+            self.logger.info(f"📥 [StandX WS] Raw order update: {order}")
+
+            # 过滤合约 - 支持两种字段名格式
+            contract_id = order.get('contract_id') or order.get('symbol')
+            if contract_id and contract_id != self.standx_symbol:
                 return
 
-            # 如果 OrderManager 依赖 client_order_id 匹配，需确保 StandXClient 正确解析并返回
-            # 这里我们简化逻辑，只要是 Filled 就触发对冲
-            
-            order_id = order.get('order_id')
-            status = order.get('status')
-            side = order.get('side', '').lower()
-            filled_size = Decimal(str(order.get('filled_size', '0')))
-            size = Decimal(str(order.get('size', '0')))
-            price = order.get('price', '0')
+            # 支持驼峰和下划线两种字段名格式 (StandX API 返回下划线格式)
+            order_id = order.get('cl_ord_id') or order.get('order_id') or order.get('orderId') or order.get('clOrdId')
+            status = (order.get('status') or order.get('orderStatus') or '').upper()
+            side = (order.get('side') or '').lower()
+            # StandX 使用 fill_qty 表示成交数量
+            filled_size = Decimal(str(order.get('fill_qty') or order.get('filled_qty') or order.get('filled_size') or order.get('filledSize') or order.get('filledQty') or '0'))
+            size = Decimal(str(order.get('qty') or order.get('size') or '0'))
+            # StandX 使用 fill_avg_price 表示成交均价
+            price = order.get('fill_avg_price') or order.get('price') or order.get('avg_price') or order.get('avgPrice') or '0'
 
             # Determine Order Type (Open/Close) logic
             if side == 'buy':
@@ -247,7 +254,19 @@ class StandxArb:
             # OrderManager 可能用 update_edgex_order_status 记录状态
             self.order_manager.update_edgex_order_status(status)
 
+            # 只处理当前活跃订单的成交，忽略旧订单的延迟通知
             if status == 'FILLED' and filled_size > 0:
+                if self.current_order_id and order_id != self.current_order_id:
+                    self.logger.warning(
+                        f"⚠️ [Stale Order] Ignoring fill for old order {order_id}, current={self.current_order_id}")
+                    # 仍然更新持仓跟踪，但不触发对冲
+                    if self.position_tracker:
+                        if side == 'buy':
+                            self.position_tracker.update_edgex_position(filled_size)
+                        else:
+                            self.position_tracker.update_edgex_position(-filled_size)
+                    return
+
                 self.logger.info(
                     f"✅ [StandX Filled] {side.upper()} {filled_size} @ {price} (id={order_id})")
 
@@ -435,7 +454,8 @@ class StandxArb:
         await asyncio.sleep(5)
 
         # Initial positions
-        self.position_tracker.edgex_position = await self.position_tracker.get_edgex_position()
+        # StandX 策略使用 standx_client 获取持仓，而不是 edgex_client
+        self.position_tracker.edgex_position = await self.standx_client.get_account_positions()
         self.position_tracker.lighter_position = await self.position_tracker.get_lighter_position()
 
         self.logger.info(f"📍 Starting main trading loop")
@@ -523,7 +543,8 @@ class StandxArb:
         """Execute trade pair (StandX Maker -> Lighter Taker)."""
         self.order_manager.order_execution_complete = False
         self.order_manager.waiting_for_lighter_fill = False
-        
+        self.current_order_id = None  # Reset at start
+
         try:
             self.logger.info(f"1️⃣ Placing StandX {side.upper()} Order...")
             
@@ -550,18 +571,32 @@ class StandxArb:
                 return
 
             self.logger.info(f"✅ StandX Order Placed: {res.order_id}")
-            
-            # 记录下单以便 WS 回调处理 (OrderManager 可能需要知道此 ID)
-            # self.order_manager.register_active_order(res.order_id) # 假设有此方法
-            
+
+            # 设置当前订单ID，用于过滤旧订单的延迟成交通知
+            self.current_order_id = res.order_id
+
             # 等待成交 (WS 回调会更新 order_manager.waiting_for_lighter_fill)
             wait_start = time.time()
             while not self.order_manager.waiting_for_lighter_fill and not self.stop_flag:
                 await asyncio.sleep(0.01)
                 if time.time() - wait_start > self.fill_timeout:
                     self.logger.warning("⏳ StandX Order Timeout, Cancelling...")
-                    await self.standx_client.cancel_order(res.order_id)
-                    return
+                    cancel_result = await self.standx_client.cancel_order(res.order_id)
+
+                    # 等待取消确认或成交确认 (最多等待3秒)
+                    cancel_wait_start = time.time()
+                    while time.time() - cancel_wait_start < 3.0:
+                        await asyncio.sleep(0.1)
+                        # 如果在等待取消期间订单成交了，需要继续对冲
+                        if self.order_manager.waiting_for_lighter_fill:
+                            self.logger.info("📥 Order filled during cancel wait, proceeding to hedge...")
+                            break
+
+                    # 如果取消期间没有成交，直接返回
+                    if not self.order_manager.waiting_for_lighter_fill:
+                        self.logger.info("✅ Order cancelled successfully, no fill detected")
+                        self.current_order_id = None  # Clear order ID
+                        return
 
             # 执行对冲
             if self.order_manager.waiting_for_lighter_fill:
@@ -572,6 +607,7 @@ class StandxArb:
                     self.order_manager.current_lighter_price,
                     self.stop_flag
                 )
+                self.current_order_id = None  # Clear after hedge complete
 
         except Exception as e:
             self.logger.error(f"Trade Execution Error: {e}")
