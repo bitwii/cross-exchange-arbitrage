@@ -11,6 +11,7 @@ import time
 import asyncio
 import logging
 import traceback
+import uuid
 import websockets
 import aiohttp
 from decimal import Decimal
@@ -424,6 +425,9 @@ class StandXClient(BaseExchangeClient):
             else:
                 raise ValueError(f"Invalid direction: {direction}")
 
+            # 生成 cl_ord_id，用于匹配 WS 回调
+            cl_ord_id = str(uuid.uuid4())
+
             # 使用 http_client.place_order 并传入 auth_client 进行签名
             order_type = "limit" if price else "market"
             result = self.http_client.place_order(
@@ -435,6 +439,7 @@ class StandXClient(BaseExchangeClient):
                 time_in_force="gtc",
                 reduce_only=False,
                 price=str(price) if price else None,
+                cl_ord_id=cl_ord_id,
                 auth=self.auth_client
             )
 
@@ -447,7 +452,7 @@ class StandXClient(BaseExchangeClient):
 
             return OrderResult(
                 success=True,
-                order_id=result.get("request_id"),
+                order_id=cl_ord_id,  # 使用 cl_ord_id 以匹配 WS 回调
                 side=side,
                 size=quantity,
                 price=price,

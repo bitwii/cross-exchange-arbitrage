@@ -28,7 +28,8 @@ from .data_logger import DataLogger
 from .order_book_manager import OrderBookManager
 from .websocket_manager import WebSocketManagerWrapper
 from .order_manager import OrderManager
-from .position_tracker import PositionTracker
+from .standx_position_tracker import StandXPositionTracker
+from .dynamic_threshold import DynamicThresholdCalculator
 
 
 class Config:
@@ -47,8 +48,8 @@ class StandxArb:
 
     def __init__(self, ticker: str, order_quantity: Decimal,
                  fill_timeout: int = 5, max_position: Decimal = Decimal('0'),
-                 long_ex_threshold: Decimal = Decimal('10'),
-                 short_ex_threshold: Decimal = Decimal('10')):
+                 long_ex_threshold: Decimal = Decimal('100'),
+                 short_ex_threshold: Decimal = Decimal('100')):
         """Initialize the arbitrage trading bot."""
         self.ticker = ticker
         self.order_quantity = order_quantity
@@ -59,6 +60,22 @@ class StandxArb:
 
         self.long_ex_threshold = long_ex_threshold
         self.short_ex_threshold = short_ex_threshold
+
+        # Dynamic threshold configuration
+        self.use_dynamic_threshold = os.getenv('USE_DYNAMIC_THRESHOLD', 'false').lower() == 'true'
+        dynamic_window = int(os.getenv('DYNAMIC_THRESHOLD_WINDOW', '1000'))
+        dynamic_interval = int(os.getenv('DYNAMIC_THRESHOLD_UPDATE_INTERVAL', '300'))
+        dynamic_min = Decimal(os.getenv('DYNAMIC_THRESHOLD_MIN', '1.0'))
+        dynamic_max = Decimal(os.getenv('DYNAMIC_THRESHOLD_MAX', '20.0'))
+        dynamic_percentile = float(os.getenv('DYNAMIC_THRESHOLD_PERCENTILE', '0.70'))
+
+        self.dynamic_threshold = DynamicThresholdCalculator(
+            window_size=dynamic_window,
+            update_interval=dynamic_interval,
+            min_threshold=dynamic_min,
+            max_threshold=dynamic_max,
+            percentile=dynamic_percentile,
+        )
 
         # Setup logger
         self._setup_logger()
@@ -98,7 +115,7 @@ class StandxArb:
         # BBO logging control
         self.last_bbo_log_time = None
         self.last_status_log_time = None
-        self.bbo_log_interval = 3600
+        self.bbo_log_interval = 1800  # 半小时打印一次状态
 
         # Price tolerance
         self.price_tolerance_pct = Decimal('0.05')
@@ -223,8 +240,13 @@ class StandxArb:
         Triggered by StandXClient.
         """
         try:
-            # 打印原始订单数据用于调试
-            self.logger.info(f"📥 [StandX WS] Raw order update: {order}")
+            # 打印关键订单信息
+            self.logger.info(
+                f"📥 [StandX WS] Order: id={order.get('cl_ord_id', '')[:8]}... "
+                f"side={order.get('side')} qty={order.get('qty')} "
+                f"fill={order.get('fill_qty')}@{order.get('fill_avg_price')} "
+                f"status={order.get('status')}"
+            )
 
             # 过滤合约 - 支持两种字段名格式
             contract_id = order.get('contract_id') or order.get('symbol')
@@ -251,7 +273,7 @@ class StandxArb:
                 status = 'FILLED'
 
             # 模拟 EdgeX 的状态更新逻辑给 OrderManager
-            # OrderManager 可能用 update_edgex_order_status 记录状态
+            # OrderManager 用 update_standx_order_status 记录状态
             self.order_manager.update_edgex_order_status(status)
 
             # 只处理当前活跃订单的成交，忽略旧订单的延迟通知
@@ -262,9 +284,9 @@ class StandxArb:
                     # 仍然更新持仓跟踪，但不触发对冲
                     if self.position_tracker:
                         if side == 'buy':
-                            self.position_tracker.update_edgex_position(filled_size)
+                            self.position_tracker.update_standx_position(filled_size)
                         else:
-                            self.position_tracker.update_edgex_position(-filled_size)
+                            self.position_tracker.update_standx_position(-filled_size)
                     return
 
                 self.logger.info(
@@ -272,9 +294,9 @@ class StandxArb:
 
                 if self.position_tracker:
                     if side == 'buy':
-                        self.position_tracker.update_edgex_position(filled_size)
+                        self.position_tracker.update_standx_position(filled_size)
                     else:
-                        self.position_tracker.update_edgex_position(-filled_size)
+                        self.position_tracker.update_standx_position(-filled_size)
 
                 self.logger.info(
                     f"[{order_id}] [{order_type}] [StandX] [{status}]: {filled_size} @ {price}")
@@ -291,7 +313,7 @@ class StandxArb:
                 self.logger.info(
                     f"🔄 [Trigger Hedge] StandX {side} filled, preparing Lighter hedge order...")
 
-                # 复用 handle_edgex_order_update 触发对冲逻辑
+                # 触发对冲逻辑
                 self.order_manager.handle_edgex_order_update({
                     'order_id': order_id,
                     'side': side,
@@ -416,11 +438,11 @@ class StandxArb:
                 ticker_info = self.standx_client.get_ticker(self.standx_symbol)
                 # 简单的 tick size 推断或 hardcode
                 # self.standx_tick_size = ... 
-                pass
+                pass 
             except:
                 pass
 
-            self.logger.info(f"Info loaded - StandX: {self.standx_symbol}, Lighter ID: {self.lighter_market_index}")
+            self.logger.info(f"Infoloaded - SX: {self.standx_symbol}, Lighter ID: {self.lighter_market_index}")
 
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize: {e}")
@@ -428,8 +450,7 @@ class StandxArb:
             return
 
         # Initialize position tracker
-        # 我们传入 standx_client，假设 PositionTracker 使用 duck typing 兼容 BaseExchangeClient 接口
-        self.position_tracker = PositionTracker(
+        self.position_tracker = StandXPositionTracker(
             self.ticker,
             self.standx_client,
             self.standx_symbol,
@@ -454,22 +475,20 @@ class StandxArb:
         await asyncio.sleep(5)
 
         # Initial positions
-        # StandX 策略使用 standx_client 获取持仓，而不是 edgex_client
-        self.position_tracker.edgex_position = await self.standx_client.get_account_positions()
+        # StandX 策略使用 standx_client 获取持仓
+        self.position_tracker.standx_position = await self.standx_client.get_account_positions()
         self.position_tracker.lighter_position = await self.position_tracker.get_lighter_position()
 
-        self.logger.info(f"📍 Starting main trading loop")
+        self.logger.info(f"📍 Starting main trading loop! st pos:{self.position_tracker.standx_position}, lt pos: {self.position_tracker.lighter_position}")
 
         while not self.stop_flag:
             # 1. Fetch StandX BBO
             try:
                 # 使用 StandXClient 的 get_ticker 获取价格
-                # 注意：EdgeX 是通过 OrderManager 的 fetch_edgex_bbo_prices 封装调用的
-                # 这里我们直接调用 client，或者确保 OrderManager 兼容
                 ticker_data = self.standx_client.get_ticker(self.standx_symbol)
                 ex_best_bid = Decimal(str(ticker_data.get('bid_price') or 0))
                 ex_best_ask = Decimal(str(ticker_data.get('ask_price') or 0))
-                
+                # self.logger.info(f"StandX BBO: {ex_best_bid}/{ex_best_ask}")
                 if ex_best_bid <= 0 or ex_best_ask <= 0:
                     # self.logger.warning("StandX BBO not ready")
                     await asyncio.sleep(0.5)
@@ -481,45 +500,60 @@ class StandxArb:
 
             # 2. Fetch Lighter BBO
             lighter_bid, lighter_ask = self.order_book_manager.get_lighter_bbo()
-
+            # self.logger.info(f"Lighter BBO: {lighter_bid}/{lighter_ask}")
+        
             # 3. Strategy Logic
             long_ex = False
             short_ex = False
-            
+
+            # Calculate spreads
+            long_spread = (lighter_bid - ex_best_bid) if (lighter_bid and ex_best_bid) else Decimal('0')
+            short_spread = (ex_best_ask - lighter_ask) if (ex_best_ask and lighter_ask) else Decimal('0')
+
+            # Add spread observation to dynamic threshold calculator
+            if lighter_bid and ex_best_bid and lighter_ask and ex_best_ask:
+                self.dynamic_threshold.add_spread_observation(long_spread, short_spread)
+
+            # Get current thresholds (dynamic or fixed)
+            if self.use_dynamic_threshold:
+                long_threshold, short_threshold = self.dynamic_threshold.get_thresholds()
+            else:
+                long_threshold = self.long_ex_threshold
+                short_threshold = self.short_ex_threshold
+
             # Logic: Buy StandX (Maker), Sell Lighter (Taker)
-            if (lighter_bid and ex_best_bid and 
-                lighter_bid - ex_best_bid > self.long_ex_threshold):
+            if (lighter_bid and ex_best_bid and long_spread > long_threshold):
                 long_ex = True
-                
+
             # Logic: Sell StandX (Maker), Buy Lighter (Taker)
-            elif (ex_best_ask and lighter_ask and 
-                  ex_best_ask - lighter_ask > self.short_ex_threshold):
+            elif (ex_best_ask and lighter_ask and short_spread > short_threshold):
                 short_ex = True
 
             # Logging
             current_time = time.time()
-            if (long_ex or short_ex or 
-                self.last_status_log_time is None or 
+            if (long_ex or short_ex or
+                self.last_status_log_time is None or
                 (current_time - self.last_status_log_time >= self.bbo_log_interval)):
-                
-                long_spread = (lighter_bid - ex_best_bid) if (lighter_bid and ex_best_bid) else Decimal('0')
-                short_spread = (ex_best_ask - lighter_ask) if (ex_best_ask and lighter_ask) else Decimal('0')
-                
+
+                threshold_mode = "dynamic" if self.use_dynamic_threshold else "fixed"
                 self.logger.info(
                     f"📊 ST: {ex_best_bid}/{ex_best_ask} | LT: {lighter_bid}/{lighter_ask} | "
                     f"L_Spr: {long_spread:.2f} | S_Spr: {short_spread:.2f} | "
-                    f"Pos: ST={self.position_tracker.get_current_edgex_position()} LT={self.position_tracker.lighter_position}"
+                    f"Th({threshold_mode}): {long_threshold:.2f}/{short_threshold:.2f} | "
+                    f"Pos: ST={self.position_tracker.get_current_standx_position()} LT={self.position_tracker.lighter_position}"
                 )
                 self.last_status_log_time = current_time
 
-            if self.stop_flag: break
+            if self.stop_flag: 
+                self.logger.info("🛑 Stop flag detected, exiting trading loop")
+                break
 
             # Execute Trades
-            current_position = self.position_tracker.get_current_edgex_position()
+            current_position = self.position_tracker.get_current_standx_position()
 
             if long_ex:
                 if current_position < self.max_position:
-                    self.logger.info(f"🚀 OPPORTUNITY: Long StandX (Spread: {lighter_bid - ex_best_bid:.2f})")
+                    self.logger.info(f"🚀 OPPORTUNITY: Long StandX (Spread: {long_spread:.2f} > Th: {long_threshold:.2f})")
                     # 做多 StandX: 挂买单 @ Ask 附近
                     await self._execute_trade('buy', ex_best_ask, lighter_bid)
                 else:
@@ -529,7 +563,7 @@ class StandxArb:
 
             elif short_ex:
                 if current_position > -1 * self.max_position:
-                    self.logger.info(f"🚀 OPPORTUNITY: Short StandX (Spread: {ex_best_ask - lighter_ask:.2f})")
+                    self.logger.info(f"🚀 OPPORTUNITY: Short StandX (Spread: {short_spread:.2f} > Th: {short_threshold:.2f})")
                     # 做空 StandX: 挂卖单 @ Bid 附近
                     await self._execute_trade('sell', ex_best_bid, lighter_ask)
                 else:
